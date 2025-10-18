@@ -19,7 +19,7 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# CORS middleware - FIXED: Added all possible frontend URLs
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -33,13 +33,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In-memory storage (replace with database in production)
+# In-memory storage
 user_sessions = {}
 file_storage = {}
 user_usage = {}
-users_db = {}  # Simple user database
+users_db = {}
 
-# Pydantic models - FIXED: Added proper request models
+# Pydantic models
 class LoginRequest(BaseModel):
     email: str
     password: str
@@ -50,7 +50,7 @@ class SignupRequest(BaseModel):
     password: str
     full_name: Optional[str] = None
 
-# Utility functions - FIXED: Added proper user management
+# Utility functions
 def generate_session_id():
     return hashlib.md5(str(datetime.now()).encode()).hexdigest()
 
@@ -63,19 +63,18 @@ def increment_user_usage(email: str, today: date):
     user_usage[key] = user_usage.get(key, 0) + 1
 
 def authenticate_user(email: str, password: str) -> bool:
-    # Check if user exists and password matches
     user = users_db.get(email)
-    if user and user.get('password') == password:  # In production, use proper hashing
+    if user and user.get('password') == password:
         return True
     return False
 
 def create_user(email: str, password: str, full_name: Optional[str]) -> bool:
     if email in users_db:
-        return False  # User already exists
+        return False
     
     users_db[email] = {
         'email': email,
-        'password': password,  # In production, hash this password
+        'password': password,
         'full_name': full_name,
         'created_at': datetime.now().isoformat()
     }
@@ -86,13 +85,12 @@ def get_current_user(session_id: Optional[str] = Query(None)):
         raise HTTPException(status_code=401, detail="Not authenticated")
     return user_sessions[session_id]
 
-# AI Analysis Service (same as before)
+# AI Analysis Service
 class DataAnalyzer:
     @staticmethod
     def analyze_dataframe(df: pd.DataFrame) -> Dict[str, Any]:
         """Analyze dataframe and return insights"""
         try:
-            # Basic profiling
             profiling = {
                 "rows": len(df),
                 "columns": len(df.columns),
@@ -101,18 +99,15 @@ class DataAnalyzer:
                 "shape": df.shape
             }
 
-            # Data types
             dtypes = {
                 col: str(dtype) for col, dtype in df.dtypes.items()
             }
 
-            # Numeric columns analysis
             numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
             numeric_stats = {}
             if numeric_cols:
                 numeric_stats = df[numeric_cols].describe().to_dict()
 
-            # Categorical columns
             categorical_cols = df.select_dtypes(include=['object']).columns.tolist()
             categorical_stats = {}
             for col in categorical_cols[:3]:
@@ -123,7 +118,6 @@ class DataAnalyzer:
                         "top_values": value_counts
                     }
 
-            # Sample data
             sample_data = df.head(10).fillna('').to_dict('records')
 
             return {
@@ -153,14 +147,12 @@ class DataAnalyzer:
         try:
             rows, cols = df.shape
             
-            # Generate summary
             insights["summary"] = (
                 f"This dataset contains {rows} rows and {cols} columns. "
                 f"Found {len(df.select_dtypes(include=[np.number]).columns)} numeric columns "
                 f"and {len(df.select_dtypes(include=['object']).columns)} text columns."
             )
 
-            # Key findings
             if rows > 0:
                 insights["key_findings"].extend([
                     f"Dataset has {df.isnull().sum().sum()} missing values across all columns",
@@ -168,7 +160,6 @@ class DataAnalyzer:
                     f"Memory usage: {df.memory_usage(deep=True).sum() / 1024 / 1024:.2f} MB"
                 ])
 
-            # Recommendations
             insights["recommendations"].extend([
                 "Consider handling missing values before analysis",
                 "Verify data types for each column",
@@ -176,7 +167,6 @@ class DataAnalyzer:
                 "Normalize numeric columns if using machine learning"
             ])
 
-            # Add specific recommendations based on data
             numeric_cols = df.select_dtypes(include=[np.number]).columns
             if len(numeric_cols) > 0:
                 insights["recommendations"].append(
@@ -206,7 +196,6 @@ async def health_check():
         "timestamp": datetime.now().isoformat()
     }
 
-# FIXED: Login endpoint - now properly accepts request body
 @app.post("/api/auth/login")
 async def login(request: LoginRequest, response: Response):
     try:
@@ -240,7 +229,6 @@ async def login(request: LoginRequest, response: Response):
         print(f"Login error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Login failed: {str(e)}")
 
-# FIXED: Signup endpoint - already working
 @app.post("/api/auth/signup")
 async def signup(request: SignupRequest, response: Response):
     try:
@@ -257,7 +245,7 @@ async def signup(request: SignupRequest, response: Response):
                 key="session_id",
                 value=session_id,
                 httponly=True,
-                max_age=3600 * 24 * 30,  # 30 days
+                max_age=3600 * 24 * 30,
                 samesite="lax"
             )
             
@@ -274,18 +262,16 @@ async def signup(request: SignupRequest, response: Response):
         print(f"Signup error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Signup failed: {str(e)}")
 
-# FIXED: Analyze endpoint - added proper authentication
 @app.post("/api/analyze")
 async def analyze_data(
     file: UploadFile = File(...),
     session_id: Optional[str] = Query(None),
     business_goal: Optional[str] = Query("general analysis"),
-    current_user: dict = Depends(get_current_user)  # This ensures user is authenticated
+    current_user: dict = Depends(get_current_user)
 ):
     try:
         print(f"Analysis request from: {current_user['email']}")
         
-        # Check usage limits
         user_email = current_user["email"]
         today = date.today()
         
@@ -299,16 +285,13 @@ async def analyze_data(
                 }
             )
 
-        # Read and validate file
         if not file.filename:
             raise HTTPException(status_code=400, detail="No file provided")
 
-        # Check file size
         file_content = await file.read()
         if len(file_content) > 10 * 1024 * 1024:
             raise HTTPException(status_code=400, detail="File too large. Maximum size is 10MB")
 
-        # Process file based on type
         file_extension = file.filename.lower().split('.')[-1]
         
         try:
@@ -321,19 +304,16 @@ async def analyze_data(
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Error reading file: {str(e)}")
 
-        # Validate dataframe
         if df.empty:
             raise HTTPException(status_code=400, detail="File appears to be empty")
 
         if len(df.columns) == 0:
             raise HTTPException(status_code=400, detail="No columns found in the file")
 
-        # Perform analysis
         analyzer = DataAnalyzer()
         analysis_result = analyzer.analyze_dataframe(df)
         insights = analyzer.generate_insights(df)
 
-        # Store file metadata
         file_hash = hashlib.md5(file_content).hexdigest()
         file_storage[file_hash] = {
             "filename": file.filename,
@@ -342,7 +322,6 @@ async def analyze_data(
             "user": user_email
         }
 
-        # Increment usage
         increment_user_usage(user_email, today)
 
         return {
@@ -374,7 +353,7 @@ async def ai_summary(
     file: UploadFile = File(...),
     business_goal: str = Query(""),
     audience: str = Query("executive"),
-    current_user: dict = Depends(get_current_user)  # Added authentication
+    current_user: dict = Depends(get_current_user)
 ):
     try:
         print(f"AI Summary request from: {current_user['email']}")
@@ -452,18 +431,11 @@ async def general_exception_handler(request: Request, exc: Exception):
         }
     )
 
-# Vercel handler
+# Vercel handler - FIXED: Proper Mangum initialization
 try:
     from mangum import Mangum
-    handler = Mangum(app)
-    print("✅ Mangum handler initialized successfully")
+    handler = Mangum(app, lifespan="off")
+    print("✅ Mangum handler initialized successfully for Vercel")
 except ImportError:
-    print("⚠️ Mangum not available - using fallback handler")
-    def handler(event, context):
-        return {
-            "statusCode": 500,
-            "body": json.dumps({
-                "error": "Mangum not installed",
-                "message": "Please install mangum for serverless deployment"
-            })
-        }
+    print("⚠️ Mangum not available")
+    handler = None
