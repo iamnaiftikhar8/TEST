@@ -7,7 +7,7 @@ import hashlib
 from datetime import datetime, date
 from typing import Optional, Dict, Any
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Response, Query
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Response, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -19,10 +19,15 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# CORS middleware
+# CORS middleware - FIXED: Added all possible frontend URLs
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, replace with your frontend URL
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000", 
+        "https://data-pulse-one.vercel.app",
+        "https://*.vercel.app"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -32,23 +37,20 @@ app.add_middleware(
 user_sessions = {}
 file_storage = {}
 user_usage = {}
+users_db = {}  # Simple user database
 
-# Pydantic models
+# Pydantic models - FIXED: Added proper request models
 class LoginRequest(BaseModel):
     email: str
     password: str
+    remember: bool = False
 
 class SignupRequest(BaseModel):
     email: str
     password: str
     full_name: Optional[str] = None
 
-class AnalysisResponse(BaseModel):
-    success: bool
-    data: Dict[str, Any]
-    error: Optional[str] = None
-
-# Utility functions
+# Utility functions - FIXED: Added proper user management
 def generate_session_id():
     return hashlib.md5(str(datetime.now()).encode()).hexdigest()
 
@@ -61,14 +63,30 @@ def increment_user_usage(email: str, today: date):
     user_usage[key] = user_usage.get(key, 0) + 1
 
 def authenticate_user(email: str, password: str) -> bool:
-    # Simple authentication - replace with proper auth in production
-    return True
+    # Check if user exists and password matches
+    user = users_db.get(email)
+    if user and user.get('password') == password:  # In production, use proper hashing
+        return True
+    return False
 
 def create_user(email: str, password: str, full_name: Optional[str]) -> bool:
-    # Simple user creation - replace with database in production
+    if email in users_db:
+        return False  # User already exists
+    
+    users_db[email] = {
+        'email': email,
+        'password': password,  # In production, hash this password
+        'full_name': full_name,
+        'created_at': datetime.now().isoformat()
+    }
     return True
 
-# AI Analysis Service
+def get_current_user(session_id: Optional[str] = Query(None)):
+    if not session_id or session_id not in user_sessions:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return user_sessions[session_id]
+
+# AI Analysis Service (same as before)
 class DataAnalyzer:
     @staticmethod
     def analyze_dataframe(df: pd.DataFrame) -> Dict[str, Any]:
@@ -97,7 +115,7 @@ class DataAnalyzer:
             # Categorical columns
             categorical_cols = df.select_dtypes(include=['object']).columns.tolist()
             categorical_stats = {}
-            for col in categorical_cols[:3]:  # Limit to first 3 categorical columns
+            for col in categorical_cols[:3]:
                 if col in df.columns:
                     value_counts = df[col].value_counts().head(5).to_dict()
                     categorical_stats[col] = {
@@ -184,13 +202,16 @@ async def root():
 async def health_check():
     return {
         "status": "healthy",
-        "database": "in_memory",  # Replace with actual DB check
+        "database": "in_memory",
         "timestamp": datetime.now().isoformat()
     }
 
+# FIXED: Login endpoint - now properly accepts request body
 @app.post("/api/auth/login")
 async def login(request: LoginRequest, response: Response):
     try:
+        print(f"Login attempt for: {request.email}")
+        
         if authenticate_user(request.email, request.password):
             session_id = generate_session_id()
             user_sessions[session_id] = {
@@ -202,7 +223,7 @@ async def login(request: LoginRequest, response: Response):
                 key="session_id",
                 value=session_id,
                 httponly=True,
-                max_age=3600,
+                max_age=3600 * 24 * 30 if request.remember else 3600,
                 samesite="lax"
             )
             
@@ -213,14 +234,18 @@ async def login(request: LoginRequest, response: Response):
                 "user": {"email": request.email}
             }
         else:
-            raise HTTPException(status_code=401, detail="Invalid credentials")
+            raise HTTPException(status_code=401, detail="Invalid email or password")
             
     except Exception as e:
+        print(f"Login error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Login failed: {str(e)}")
 
+# FIXED: Signup endpoint - already working
 @app.post("/api/auth/signup")
 async def signup(request: SignupRequest, response: Response):
     try:
+        print(f"Signup attempt for: {request.email}")
+        
         if create_user(request.email, request.password, request.full_name):
             session_id = generate_session_id()
             user_sessions[session_id] = {
@@ -232,7 +257,7 @@ async def signup(request: SignupRequest, response: Response):
                 key="session_id",
                 value=session_id,
                 httponly=True,
-                max_age=3600,
+                max_age=3600 * 24 * 30,  # 30 days
                 samesite="lax"
             )
             
@@ -246,24 +271,25 @@ async def signup(request: SignupRequest, response: Response):
             raise HTTPException(status_code=400, detail="User already exists")
             
     except Exception as e:
+        print(f"Signup error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Signup failed: {str(e)}")
 
+# FIXED: Analyze endpoint - added proper authentication
 @app.post("/api/analyze")
 async def analyze_data(
     file: UploadFile = File(...),
     session_id: Optional[str] = Query(None),
-    business_goal: Optional[str] = Query("general analysis")
+    business_goal: Optional[str] = Query("general analysis"),
+    current_user: dict = Depends(get_current_user)  # This ensures user is authenticated
 ):
     try:
-        # Check authentication (simplified)
-        if session_id and session_id not in user_sessions:
-            raise HTTPException(status_code=401, detail="Invalid session")
+        print(f"Analysis request from: {current_user['email']}")
         
         # Check usage limits
-        user_email = user_sessions.get(session_id, {}).get("email", "anonymous")
+        user_email = current_user["email"]
         today = date.today()
         
-        if get_user_usage(user_email, today) >= 40:  # Free limit
+        if get_user_usage(user_email, today) >= 40:
             return JSONResponse(
                 status_code=402,
                 content={
@@ -277,7 +303,7 @@ async def analyze_data(
         if not file.filename:
             raise HTTPException(status_code=400, detail="No file provided")
 
-        # Check file size (limit to 10MB for Vercel)
+        # Check file size
         file_content = await file.read()
         if len(file_content) > 10 * 1024 * 1024:
             raise HTTPException(status_code=400, detail="File too large. Maximum size is 10MB")
@@ -307,7 +333,7 @@ async def analyze_data(
         analysis_result = analyzer.analyze_dataframe(df)
         insights = analyzer.generate_insights(df)
 
-        # Store file metadata (in production, use database)
+        # Store file metadata
         file_hash = hashlib.md5(file_content).hexdigest()
         file_storage[file_hash] = {
             "filename": file.filename,
@@ -340,16 +366,19 @@ async def analyze_data(
     except HTTPException:
         raise
     except Exception as e:
+        print(f"Analysis error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
 
 @app.post("/api/ai-summary")
 async def ai_summary(
     file: UploadFile = File(...),
     business_goal: str = Query(""),
-    audience: str = Query("executive")
+    audience: str = Query("executive"),
+    current_user: dict = Depends(get_current_user)  # Added authentication
 ):
     try:
-        # Simple AI summary endpoint
+        print(f"AI Summary request from: {current_user['email']}")
+        
         file_content = await file.read()
         
         if file.filename.lower().endswith('.csv'):
@@ -381,23 +410,21 @@ async def ai_summary(
         }
 
     except Exception as e:
+        print(f"AI Summary error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"AI summary failed: {str(e)}")
 
 @app.get("/api/user/profile")
-async def get_profile(session_id: Optional[str] = Query(None)):
-    if not session_id or session_id not in user_sessions:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    
-    user_data = user_sessions[session_id]
+async def get_profile(current_user: dict = Depends(get_current_user)):
+    user_email = current_user["email"]
     today = date.today()
     
     return {
         "success": True,
         "user": {
-            "email": user_data["email"],
-            "today_usage": get_user_usage(user_data["email"], today),
+            "email": user_email,
+            "today_usage": get_user_usage(user_email, today),
             "daily_limit": 40,
-            "remaining_analysis": max(0, 40 - get_user_usage(user_data["email"], today))
+            "remaining_analysis": max(0, 40 - get_user_usage(user_email, today))
         }
     }
 
@@ -415,6 +442,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 
 @app.exception_handler(Exception)
 async def general_exception_handler(request: Request, exc: Exception):
+    print(f"Unhandled error: {str(exc)}")
     return JSONResponse(
         status_code=500,
         content={
@@ -428,9 +456,9 @@ async def general_exception_handler(request: Request, exc: Exception):
 try:
     from mangum import Mangum
     handler = Mangum(app)
-    print("Mangum handler initialized successfully")
+    print("✅ Mangum handler initialized successfully")
 except ImportError:
-    print("Mangum not available - using fallback handler")
+    print("⚠️ Mangum not available - using fallback handler")
     def handler(event, context):
         return {
             "statusCode": 500,
