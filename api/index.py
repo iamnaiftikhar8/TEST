@@ -699,17 +699,21 @@ async def logout(request: Request, response: Response):
     """User logout"""
     response.delete_cookie("dp_session_id", path="/")
     return {"success": True, "message": "Logout successful"}
-@app.get("/api/debug/quick-check")
-async def quick_check():
-    """Simple check to see if database is working"""
+
+@app.get("/api/test-db")
+async def test_db():
+    """Test if database is connected"""
     try:
         conn = get_db_conn()
         if conn:
-            return {"status": "Using SQL Server Database ✅"}
+            # Try to create tables
+            ensure_tables()
+            conn.close()
+            return {"database": "CONNECTED ✅", "storage": "SQL Server"}
         else:
-            return {"status": "Using In-Memory Storage ⚠️"}
-    except:
-        return {"status": "Using In-Memory Storage ⚠️"}
+            return {"database": "NOT CONNECTED ⚠️", "storage": "In-Memory"}
+    except Exception as e:
+        return {"database": "ERROR ❌", "error": str(e), "storage": "In-Memory"}
 # ---------------------------------------------------------
 # ✅ Error Handlers
 # ---------------------------------------------------------
