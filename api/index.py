@@ -432,10 +432,7 @@ async def general_exception_handler(request: Request, exc: Exception):
     )
 
 # Vercel handler - FIXED: Proper Mangum initialization
-try:
-    from mangum import Mangum
-    handler = Mangum(app, lifespan="off")
-    print("✅ Mangum handler initialized successfully for Vercel")
-except ImportError:
-    print("⚠️ Mangum not available")
-    handler = None
+# ✅ Correct Vercel Mangum integration
+from mangum import Mangum
+
+handler = Mangum(app)
