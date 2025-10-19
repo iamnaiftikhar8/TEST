@@ -1,6 +1,22 @@
+# Core Requirements
 fastapi
-pandas
-numpy
 uvicorn
 python-multipart
+pydantic
+
+# Database
+pyodbc
+
+# Data Processing
+pandas
+numpy
 openpyxl
+
+# Authentication
+bcrypt
+
+# AI
+google-generativeai
+
+# Environment
+python-dotenv
