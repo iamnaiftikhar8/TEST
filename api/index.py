@@ -901,14 +901,7 @@ async def analyze(
     file: UploadFile = File(...),
     auth: dict = Depends(get_current_auth),
 ):
-    # ✅ ADD THIS SIMPLE CHECK
-    sid = request.cookies.get("dp_session_id")
-    if not sid:
-        raise HTTPException(status_code=401, detail="Please log in to generate reports")
     
-    user_email = resolve_user_from_session(sid)
-    if not user_email:
-        raise HTTPException(status_code=401, detail="Please log in to generate reports")
     
     """Comprehensive data analysis"""
     user_id = auth["user_id"]
@@ -1074,6 +1067,19 @@ async def test_db():
 # ---------------------------------------------------------
 # ✅ GOOGLE OAUTH ROUTES - COMPLETE FIXED VERSION
 # ---------------------------------------------------------
+@app.get("/api/auth/check")
+async def check_auth(request: Request):
+    """Check if user is authenticated"""
+    sid = request.cookies.get("dp_session_id")
+    if not sid:
+        return {"authenticated": False}
+    
+    user_email = resolve_user_from_session(sid)
+    if user_email:
+        return {"authenticated": True, "user_id": user_email}
+    
+    return {"authenticated": False}
+
 @app.get("/api/auth/google")
 async def google_login():
     """Start Google OAuth flow"""
