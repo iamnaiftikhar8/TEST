@@ -21,7 +21,7 @@ from pydantic import BaseModel, EmailStr
 # ---------------------------------------------------------
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://data-pulse-one.vercel.app")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyBe8E5aR-g5ecP7OThZB6S_Sg-A2RAZ3bk")
-FREE_REPORTS_PER_DAY = 40
+FREE_REPORTS_PER_DAY = 50
 
 # Database configuration
 DB_HOST = os.getenv("DB_HOST", "mssql-196323-0.cloudclusters.net")
@@ -951,11 +951,6 @@ async def analyze(
         "numeric_columns": numeric_cols,
     }
 
-
-    # Generate AI insights
-    ai_service = AIService()
-    detailed_summary = ai_service.generate_detailed_summary(df, None, "executive")
-
     # Generate charts data
     charts = {}
     
@@ -1024,6 +1019,10 @@ async def analyze(
         "duplicate_rows": duplicates,
         "outliers_total": total_outliers,
     }
+
+    # Generate AI insights
+    ai_service = AIService()
+    detailed_summary = ai_service.generate_detailed_summary(df, None, "executive")
 
     return {
         "profiling": profiling,
