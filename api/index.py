@@ -61,7 +61,7 @@ app.add_middleware(
         "https://test-six-fawn-47.vercel.app"
     ],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -97,7 +97,7 @@ class AISummaryRequest(BaseModel):
     include_risk_assessment: bool = True
 
 # ---------------------------------------------------------
-# ✅ Database Functions
+# ✅ Database Functions - UPDATED FOR GOOGLE OAUTH
 # ---------------------------------------------------------
 try:
     import pyodbc as db_lib
@@ -113,7 +113,7 @@ def get_db_conn():
     return None
 
 def ensure_tables():
-    """Create necessary tables if they don't exist"""
+    """Create necessary tables if they don't exist - UPDATED with google_id"""
     conn = get_db_conn()
     if not conn:
         return
@@ -121,14 +121,15 @@ def ensure_tables():
     try:
         cursor = conn.cursor()
         
-        # Users table
+        # Users table - UPDATED with google_id
         cursor.execute("""
         IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='users' AND xtype='U')
         CREATE TABLE users (
             id INT IDENTITY PRIMARY KEY,
             email NVARCHAR(256) NOT NULL UNIQUE,
             full_name NVARCHAR(200) NULL,
-            password_hash NVARCHAR(200) NOT NULL,
+            password_hash NVARCHAR(200) NULL,  -- NULL for Google users
+            google_id NVARCHAR(128) NULL,      -- ADDED for Google OAuth
             created_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
             last_login_at DATETIME2 NULL
         )
@@ -154,7 +155,7 @@ def ensure_tables():
         conn.close()
 
 def user_by_email(email: str) -> Dict[str, Any] | None:
-    """Get user by email from database"""
+    """Get user by email from database - UPDATED with google_id"""
     conn = get_db_conn()
     if not conn:
         return users_db.get(email)
@@ -162,7 +163,7 @@ def user_by_email(email: str) -> Dict[str, Any] | None:
     try:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT id, email, full_name, password_hash, created_at, last_login_at FROM users WHERE email = ?",
+            "SELECT id, email, full_name, password_hash, google_id, created_at, last_login_at FROM users WHERE email = ?",
             (email,)
         )
         row = cursor.fetchone()
@@ -172,13 +173,48 @@ def user_by_email(email: str) -> Dict[str, Any] | None:
                 'email': row[1],
                 'full_name': row[2],
                 'password_hash': row[3],
-                'created_at': row[4],
-                'last_login_at': row[5]
+                'google_id': row[4],  # ADDED
+                'created_at': row[5],
+                'last_login_at': row[6]
             }
         return None
     except Exception as e:
         print(f"Database error: {e}")
         return users_db.get(email)
+    finally:
+        conn.close()
+
+def user_by_google_id(google_id: str) -> Dict[str, Any] | None:
+    """Get user by Google ID from database - NEW FUNCTION"""
+    conn = get_db_conn()
+    if not conn:
+        # Check in-memory storage
+        for user in users_db.values():
+            if user.get('google_id') == google_id:
+                return user
+        return None
+        
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, email, full_name, password_hash, google_id, created_at, last_login_at FROM users WHERE google_id = ?",
+            (google_id,)
+        )
+        row = cursor.fetchone()
+        if row:
+            return {
+                'id': row[0],
+                'email': row[1],
+                'full_name': row[2],
+                'password_hash': row[3],
+                'google_id': row[4],
+                'created_at': row[5],
+                'last_login_at': row[6]
+            }
+        return None
+    except Exception as e:
+        print(f"Database error: {e}")
+        return None
     finally:
         conn.close()
 
@@ -193,6 +229,7 @@ def insert_user(full_name: Optional[str], email: str, password_hash: str) -> boo
             'email': email,
             'full_name': full_name,
             'password_hash': password_hash,
+            'google_id': None,
             'created_at': datetime.now().isoformat()
         }
         return True
@@ -200,8 +237,8 @@ def insert_user(full_name: Optional[str], email: str, password_hash: str) -> boo
     try:
         cursor = conn.cursor()
         cursor.execute(
-            "INSERT INTO users (full_name, email, password_hash) VALUES (?, ?, ?)",
-            (full_name, email, password_hash)
+            "INSERT INTO users (full_name, email, password_hash, google_id) VALUES (?, ?, ?, ?)",
+            (full_name, email, password_hash, None)
         )
         conn.commit()
         return True
@@ -210,6 +247,56 @@ def insert_user(full_name: Optional[str], email: str, password_hash: str) -> boo
         return False
     finally:
         conn.close()
+
+def create_google_user(email: str, name: str, google_id: str) -> bool:
+    """Create a user for Google OAuth - NEW FUNCTION"""
+    try:
+        # Try database first
+        conn = get_db_conn()
+        if conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO users (email, full_name, google_id, password_hash) VALUES (?, ?, ?, ?)",
+                (email, name, google_id, None)  # NULL password for Google users
+            )
+            conn.commit()
+            conn.close()
+            return True
+        else:
+            # Fallback to in-memory storage
+            users_db[email] = {
+                'email': email,
+                'full_name': name,
+                'google_id': google_id,
+                'password_hash': None,
+                'created_at': datetime.now().isoformat()
+            }
+            return True
+    except Exception as e:
+        print(f"User creation error: {e}")
+        # User might already exist - that's ok
+        return True
+
+def update_user_google_id(email: str, google_id: str) -> bool:
+    """Update existing user with Google ID - NEW FUNCTION"""
+    try:
+        conn = get_db_conn()
+        if conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE users SET google_id = ? WHERE email = ?",
+                (google_id, email)
+            )
+            conn.commit()
+            conn.close()
+        else:
+            # Update in-memory storage
+            if email in users_db:
+                users_db[email]['google_id'] = google_id
+        return True
+    except Exception as e:
+        print(f"Update user error: {e}")
+        return False
 
 def ensure_session(user_id: str, session_id: Optional[str], ip: Optional[str], ua: Optional[str]) -> str:
     """Ensure session exists in database"""
@@ -973,8 +1060,10 @@ async def test_db():
             return {"database": "NOT CONNECTED ⚠️", "storage": "In-Memory"}
     except Exception as e:
         return {"database": "ERROR ❌", "error": str(e), "storage": "In-Memory"}
-    
-    
+
+# ---------------------------------------------------------
+# ✅ GOOGLE OAUTH ROUTES - COMPLETE FIXED VERSION
+# ---------------------------------------------------------
 @app.get("/api/auth/google")
 async def google_login():
     """Start Google OAuth flow"""
@@ -995,7 +1084,7 @@ async def google_login():
 
 @app.get("/api/auth/google/callback")
 async def google_callback(request: Request, response: Response, code: str = None):
-    """Handle Google OAuth callback - FIXED VERSION"""
+    """Handle Google OAuth callback - COMPLETE FIXED VERSION"""
     try:
         if not code:
             return RedirectResponse("https://data-pulse-one.vercel.app/login?error=no_code")
@@ -1037,22 +1126,24 @@ async def google_callback(request: Request, response: Response, code: str = None
         
         print(f"Google user: {email}, {name}, {google_id}")
         
-        # Check if user exists by email
-        existing_user = user_by_email(email)
+        # Check if user exists by Google ID first
+        existing_user = user_by_google_id(google_id)
         
-        if existing_user:
-            # User exists - update with Google ID if needed
-            if not existing_user.get('google_id'):
+        if not existing_user:
+            # Check if user exists by email (merge accounts)
+            existing_user = user_by_email(email)
+            if existing_user:
+                # Update existing user with Google ID
                 update_user_google_id(email, google_id)
-            user_id = existing_user['email']
-        else:
-            # Create new user
-            success = create_google_user(email, name, google_id)
-            if not success:
-                return RedirectResponse("https://data-pulse-one.vercel.app/login?error=user_creation_failed")
-            user_id = email
+            else:
+                # Create new Google user
+                if not create_google_user(email, name, google_id):
+                    return RedirectResponse("https://data-pulse-one.vercel.app/login?error=user_creation_failed")
+                existing_user = user_by_google_id(google_id)
         
-        # Create session using your EXISTING session system
+        user_id = existing_user['email']
+        
+        # Create session
         session_id = str(uuid.uuid4())
         
         # Get IP and User Agent
@@ -1060,77 +1151,27 @@ async def google_callback(request: Request, response: Response, code: str = None
         client_ip = xff.split(",")[0].strip() if xff else request.client.host
         user_agent = request.headers.get("User-Agent", "")[:512]
         
-        # Use your existing session management - FIXED function name
+        # Use your existing session management
         ensure_session(user_id, session_id, client_ip, user_agent)
         
-        # Set cookies - FIXED cookie settings
+        # Set cookies - FIXED: Use dp_session_id (matches your auth system)
         response.set_cookie(
-            key="session_id",  # Use your actual cookie name
+            key="dp_session_id",
             value=session_id,
             httponly=True,
             secure=True,
-            samesite="none",  # FIXED: removed extra quotes
-            max_age=30 * 24 * 60 * 60,  # 30 days - FIXED: proper syntax
+            samesite="none",
+            max_age=30 * 24 * 60 * 60,
             path="/"
         )
         
-        # Redirect to frontend - FIXED URL
+        # Redirect to frontend
         return RedirectResponse("https://data-pulse-one.vercel.app/analyze")
         
     except Exception as e:
         print(f"Google OAuth error: {e}")
         return RedirectResponse("https://data-pulse-one.vercel.app/login?error=auth_failed")
 
-# Add these helper functions to your backend
-def create_google_user(email: str, name: str, google_id: str) -> bool:
-    """Create a user for Google OAuth"""
-    try:
-        # Try database first
-        conn = get_db_conn()
-        if conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO users (email, full_name, google_id, password_hash) VALUES (?, ?, ?, ?)",
-                (email, name, google_id, None)  # NULL password for Google users
-            )
-            conn.commit()
-            conn.close()
-            return True
-        else:
-            # Fallback to in-memory storage
-            users_db[email] = {
-                'email': email,
-                'full_name': name,
-                'google_id': google_id,
-                'password_hash': None,
-                'created_at': datetime.now().isoformat()
-            }
-            return True
-    except Exception as e:
-        print(f"User creation error: {e}")
-        # User might already exist - that's ok
-        return True
-
-def update_user_google_id(email: str, google_id: str) -> bool:
-    """Update existing user with Google ID"""
-    try:
-        conn = get_db_conn()
-        if conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "UPDATE users SET google_id = ? WHERE email = ?",
-                (google_id, email)
-            )
-            conn.commit()
-            conn.close()
-        else:
-            # Update in-memory storage
-            if email in users_db:
-                users_db[email]['google_id'] = google_id
-        return True
-    except Exception as e:
-        print(f"Update user error: {e}")
-        return False
 # ---------------------------------------------------------
 # ✅ Session Management Routes
 # ---------------------------------------------------------
