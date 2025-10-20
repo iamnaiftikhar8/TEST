@@ -380,6 +380,52 @@ def get_current_auth(request: Request):
     return {"user_id": user_email, "session_id": new_sid}
 
 # ---------------------------------------------------------
+# ✅ NEW: Authentication Check Endpoint
+# ---------------------------------------------------------
+@app.get("/api/auth/check")
+async def check_auth(request: Request, response: Response):
+    """Check if user is authenticated"""
+    sid = request.cookies.get("dp_session_id") or request.cookies.get("session_id")
+    
+    if not sid:
+        return JSONResponse(
+            status_code=200,
+            content={"authenticated": False, "message": "No session found"}
+        )
+    
+    user_email = resolve_user_from_session(sid)
+    if not user_email:
+        return JSONResponse(
+            status_code=200,
+            content={"authenticated": False, "message": "Invalid session"}
+        )
+    
+    # Refresh session
+    xff = request.headers.get("X-Forwarded-For")
+    ip = (xff.split(",")[0].strip() if xff else None)
+    ua = request.headers.get("User-Agent")
+    ua = ua[:512] if ua else None
+    
+    new_sid = ensure_session(user_email, sid, ip, ua)
+    
+    # Update cookie
+    response.set_cookie(
+        key="dp_session_id",
+        value=new_sid,
+        httponly=True,
+        secure=True,
+        samesite="none",
+        max_age=30 * 24 * 60 * 60,
+        path="/"
+    )
+    
+    return {
+        "authenticated": True,
+        "user_id": user_email,
+        "session_id": new_sid
+    }
+
+# ---------------------------------------------------------
 # ✅ Enhanced AI Service
 # ---------------------------------------------------------
 class AIService:
@@ -424,7 +470,7 @@ class AIService:
         prompt = (
             "You are a senior data analyst. Write ONE detailed, coherent paragraph (no bullet points, no markdown) "
             f"that explains the dataset. Audience: {audience}. Business goal: {business_goal or 'general insights'}.\n\n"
-            "DATA (JSON):\n" + json.dumps(payload, default=self._json_default)
+            "DATA (JSON):\n" + json.dumps(payload, default=self._json_default, indent=2)
         )
 
         try:
