@@ -901,15 +901,6 @@ async def analyze(
     file: UploadFile = File(...),
     auth: dict = Depends(get_current_auth),
 ):
-    # ✅ ADD THIS SIMPLE CHECK
-    sid = request.cookies.get("dp_session_id")
-    if not sid:
-        raise HTTPException(status_code=401, detail="Please log in to generate reports")
-    
-    user_email = resolve_user_from_session(sid)
-    if not user_email:
-        raise HTTPException(status_code=401, detail="Please log in to generate reports")
-    
     """Comprehensive data analysis"""
     user_id = auth["user_id"]
     session_id = auth["session_id"]
@@ -1184,8 +1175,7 @@ async def google_callback(request: Request, response: Response, code: str = None
             secure=True,
             samesite="none",
             max_age=30 * 24 * 60 * 60,
-            path="/",
-            domain=".vercel.app" 
+            path="/"
         )
         
         # Redirect to frontend
