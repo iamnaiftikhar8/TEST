@@ -1040,6 +1040,19 @@ async def analyze(
         },
     }
 
+@app.get("/api/auth/check")
+async def check_auth(request: Request):
+    """Check if user is authenticated"""
+    sid = request.cookies.get("dp_session_id")
+    if not sid:
+        return {"authenticated": False}
+    
+    user_email = resolve_user_from_session(sid)
+    if user_email:
+        return {"authenticated": True, "user_id": user_email}
+    
+    return {"authenticated": False}
+
 @app.post("/api/auth/logout")
 async def logout(request: Request, response: Response):
     """User logout"""
