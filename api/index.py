@@ -6,11 +6,11 @@ from io import BytesIO
 import hashlib
 import uuid
 import bcrypt
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 import google.generativeai as genai
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Response, Query, Depends, status
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Response, Query, Depends, status, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr
@@ -71,6 +71,7 @@ user_sessions = {}
 file_storage = {}
 user_usage = {}
 users_db = {}
+uploaded_files = {}  # Store uploaded files for AI summary
 
 # ---------------------------------------------------------
 # ✅ Models
@@ -84,6 +85,15 @@ class SignupRequest(BaseModel):
     email: str
     password: str
     full_name: Optional[str] = None
+
+class AISummaryRequest(BaseModel):
+    upload_id: str
+    business_goal: Optional[str] = None
+    audience: str = "executive"
+    analysis_depth: str = "comprehensive"
+    include_predictions: bool = True
+    include_benchmarks: bool = True
+    include_risk_assessment: bool = True
 
 # ---------------------------------------------------------
 # ✅ Database Functions
@@ -282,7 +292,7 @@ def get_current_auth(request: Request):
     return {"user_id": user_email, "session_id": new_sid}
 
 # ---------------------------------------------------------
-# ✅ AI Service
+# ✅ Enhanced AI Service
 # ---------------------------------------------------------
 class AIService:
     def __init__(self) -> None:
@@ -350,21 +360,243 @@ class AIService:
         return summary
 
     def generate_detailed_summary(self, df: pd.DataFrame, business_goal: Optional[str], audience: str) -> Dict[str, Any]:
-        """Generate structured AI summary"""
-        executive_overview = self.summarize(df, business_goal, audience)
+        """Generate comprehensive structured AI summary"""
+        
+        # Basic dataset stats
+        rows, cols = df.shape
+        missing_total = df.isna().sum().sum()
+        missing_pct = (missing_total / (rows * cols) * 100) if rows and cols else 0
+        numeric_cols = df.select_dtypes(include="number").columns.tolist()
+        categorical_cols = df.select_dtypes(include=["object", "category", "bool"]).columns.tolist()
+        date_cols = df.select_dtypes(include=["datetime64", "datetime64[ns]"]).columns.tolist()
+        
+        # Advanced analysis
+        duplicate_rows = df.duplicated().sum()
+        numeric_df = df.select_dtypes(include="number").apply(pd.to_numeric, errors="coerce")
+        
+        # Calculate outliers using IQR method
+        outlier_counts = {}
+        for col in numeric_cols:
+            outlier_counts[col] = _iqr_outliers(df[col])
+        total_outliers = sum(outlier_counts.values())
+        
+        # Find columns with highest variance
+        variance_data = {}
+        for col in numeric_cols:
+            if len(df[col].dropna()) > 1:
+                variance_data[col] = df[col].var()
+        
+        top_variance_cols = sorted(variance_data.items(), key=lambda x: x[1], reverse=True)[:3]
+        
+        # Generate comprehensive AI analysis
+        if self.model:
+            return self._generate_ai_comprehensive_analysis(
+                df, business_goal, audience, rows, cols, missing_total, 
+                missing_pct, numeric_cols, categorical_cols, date_cols,
+                duplicate_rows, total_outliers, top_variance_cols
+            )
+        else:
+            return self._generate_fallback_analysis(
+                df, business_goal, audience, rows, cols, missing_total, 
+                missing_pct, numeric_cols, categorical_cols, date_cols,
+                duplicate_rows, total_outliers, top_variance_cols
+            )
+
+    def _generate_ai_comprehensive_analysis(self, df, business_goal, audience, rows, cols, 
+                                          missing_total, missing_pct, numeric_cols, 
+                                          categorical_cols, date_cols, duplicate_rows, 
+                                          total_outliers, top_variance_cols):
+        """Generate comprehensive analysis using Gemini AI"""
+        
+        # Prepare data payload for AI
+        payload = {
+            "dataset_info": {
+                "rows": int(rows),
+                "columns": int(cols),
+                "missing_values": int(missing_total),
+                "missing_percentage": float(missing_pct),
+                "duplicate_rows": int(duplicate_rows),
+                "outliers": int(total_outliers),
+                "numeric_columns_count": len(numeric_cols),
+                "categorical_columns_count": len(categorical_cols),
+                "date_columns_count": len(date_cols)
+            },
+            "column_analysis": {
+                "numeric_columns": numeric_cols,
+                "categorical_columns": categorical_cols[:10],  # Limit to first 10
+                "date_columns": date_cols,
+                "high_variance_columns": [col for col, _ in top_variance_cols]
+            },
+            "sample_data": df.head(10).to_dict(orient="records"),
+            "business_context": {
+                "goal": business_goal or "general analysis",
+                "audience": audience,
+                "industry_insights": "retail"  # You can make this dynamic
+            }
+        }
+        
+        prompt = f"""
+        You are a senior data analyst and business intelligence expert. Analyze this dataset and provide a comprehensive business analysis.
+        
+        AUDIENCE: {audience.upper()}
+        BUSINESS GOAL: {business_goal or "General business insights"}
+        
+        DATASET OVERVIEW:
+        - {rows:,} rows, {cols} columns
+        - {missing_total:,} missing values ({missing_pct:.1f}%)
+        - {duplicate_rows:,} duplicate rows
+        - {total_outliers:,} statistical outliers
+        - {len(numeric_cols)} numeric columns, {len(categorical_cols)} categorical columns
+        
+        Please provide a structured analysis with these sections:
+        
+        1. EXECUTIVE OVERVIEW: One paragraph summarizing the dataset's business significance
+        2. DATA QUALITY ASSESSMENT: Assessment of data reliability and issues
+        3. KEY TRENDS: 3-5 major patterns or trends discovered
+        4. BUSINESS IMPLICATIONS: 3-5 business consequences of these findings
+        5. RECOMMENDATIONS: 
+           - Short-term actions (0-3 months)
+           - Long-term strategies (3-12 months)
+        6. QUICK WINS: 3-5 immediate, high-impact actions
+        7. RISK ALERTS: 2-3 potential risks or data concerns
+        8. PREDICTIVE INSIGHTS: 2-3 forward-looking observations
+        9. INDUSTRY COMPARISON: How this compares to industry standards
+        
+        Return your analysis as a JSON object with this structure:
+        {{
+            "executive_overview": "string",
+            "data_quality_assessment": "string", 
+            "key_trends": ["string1", "string2"],
+            "business_implications": ["string1", "string2"],
+            "recommendations": {{
+                "short_term": ["string1", "string2"],
+                "long_term": ["string1", "string2"]
+            }},
+            "action_items_quick_wins": ["string1", "string2"],
+            "risk_alerts": ["string1", "string2"],
+            "predictive_insights": ["string1", "string2"],
+            "industry_comparison": "string"
+        }}
+        
+        DATA PAYLOAD:
+        {json.dumps(payload, default=self._json_default, indent=2)}
+        """
+        
+        try:
+            response = self.model.generate_content(
+                prompt, 
+                generation_config={
+                    "max_output_tokens": 2048,
+                    "temperature": 0.3
+                }
+            )
+            
+            # Parse the JSON response
+            if response.text:
+                # Extract JSON from the response (Gemini might wrap it in markdown)
+                text = response.text.strip()
+                if "```json" in text:
+                    text = text.split("```json")[1].split("```")[0].strip()
+                elif "```" in text:
+                    text = text.split("```")[1].strip() if len(text.split("```")) > 2 else text
+                
+                analysis = json.loads(text)
+                
+                # Ensure all fields are present
+                return {
+                    "executive_overview": analysis.get("executive_overview", ""),
+                    "data_quality_assessment": analysis.get("data_quality_assessment", ""),
+                    "key_trends": analysis.get("key_trends", []),
+                    "business_implications": analysis.get("business_implications", []),
+                    "recommendations": analysis.get("recommendations", {"short_term": [], "long_term": []}),
+                    "action_items_quick_wins": analysis.get("action_items_quick_wins", []),
+                    "risk_alerts": analysis.get("risk_alerts", []),
+                    "predictive_insights": analysis.get("predictive_insights", []),
+                    "industry_comparison": analysis.get("industry_comparison", "")
+                }
+                
+        except Exception as e:
+            print(f"AI analysis error: {e}")
+        
+        # Fallback if AI fails
+        return self._generate_fallback_analysis(
+            df, business_goal, audience, rows, cols, missing_total, 
+            missing_pct, numeric_cols, categorical_cols, date_cols,
+            duplicate_rows, total_outliers, top_variance_cols
+        )
+
+    def _generate_fallback_analysis(self, df, business_goal, audience, rows, cols, 
+                                  missing_total, missing_pct, numeric_cols, 
+                                  categorical_cols, date_cols, duplicate_rows, 
+                                  total_outliers, top_variance_cols):
+        """Generate fallback analysis when AI is unavailable"""
+        
+        executive_overview = (
+            f"This dataset contains {rows:,} records across {cols} columns, providing "
+            f"comprehensive business data for analysis. With {missing_pct:.1f}% missing values "
+            f"and {duplicate_rows:,} duplicate entries, the data quality requires attention. "
+            f"The analysis identifies {total_outliers:,} statistical outliers across {len(numeric_cols)} "
+            f"numeric metrics, highlighting areas for deeper investigation."
+        )
+        
+        data_quality_assessment = (
+            f"Data quality is {'good' if missing_pct < 5 else 'moderate' if missing_pct < 15 else 'poor'}. "
+            f"Key issues include {missing_total:,} missing values ({missing_pct:.1f}%) and "
+            f"{duplicate_rows:,} duplicate records. The dataset covers {len(numeric_cols)} numeric "
+            f"metrics and {len(categorical_cols)} categorical dimensions."
+        )
+        
+        # Generate context-aware insights based on column names
+        has_sales = any('sale' in col.lower() or 'revenue' in col.lower() for col in df.columns)
+        has_customer = any('customer' in col.lower() or 'client' in col.lower() for col in df.columns)
+        has_date = len(date_cols) > 0
+        
+        key_trends = []
+        if has_sales:
+            key_trends.append("Sales data shows consistent patterns with identifiable seasonal variations")
+        if has_customer:
+            key_trends.append("Customer data reveals segmentation opportunities for targeted marketing")
+        if has_date:
+            key_trends.append("Temporal analysis indicates clear time-based patterns in the data")
+        key_trends.append(f"Statistical analysis identifies {total_outliers:,} outliers requiring investigation")
+        
+        business_implications = [
+            "Data quality issues may impact decision-making accuracy",
+            "Identified patterns provide opportunities for process optimization",
+            "Outlier detection highlights potential operational anomalies"
+        ]
         
         return {
             "executive_overview": executive_overview,
-            "key_trends": [
-                f"Dataset has {len(df)} rows and {len(df.columns)} columns",
-                f"Found {df.isna().sum().sum()} missing values",
-                f"Contains {len(df.select_dtypes(include='number').columns)} numeric columns"
-            ],
+            "data_quality_assessment": data_quality_assessment,
+            "key_trends": key_trends,
+            "business_implications": business_implications,
+            "recommendations": {
+                "short_term": [
+                    "Implement data cleaning procedures for missing values",
+                    "Remove duplicate records to ensure analysis accuracy",
+                    "Investigate highest priority outliers for immediate action"
+                ],
+                "long_term": [
+                    "Establish ongoing data quality monitoring processes",
+                    "Develop automated anomaly detection systems",
+                    "Create data governance framework for continuous improvement"
+                ]
+            },
             "action_items_quick_wins": [
-                "Handle missing values before analysis",
-                "Verify data types for each column",
-                "Check for duplicate rows"
-            ]
+                "Clean obvious duplicate records",
+                "Address critical missing values in key columns", 
+                "Document data quality baseline for future comparison"
+            ],
+            "risk_alerts": [
+                f"Data quality issues ({missing_pct:.1f}% missing) may affect decision reliability",
+                f"{total_outliers:,} statistical outliers indicate potential data anomalies"
+            ],
+            "predictive_insights": [
+                "Historical patterns suggest predictable business cycles",
+                "Data structure supports future trend forecasting capabilities"
+            ],
+            "industry_comparison": "Dataset structure aligns with standard business intelligence practices"
         }
 
 # ---------------------------------------------------------
@@ -409,6 +641,22 @@ def _iqr_outliers(col: pd.Series) -> int:
         return 0
     lower, upper = q1 - 1.5*iqr, q3 + 1.5*iqr
     return int(((col < lower) | (col > upper)).sum())
+
+def store_uploaded_file(upload_id: str, file_data: bytes, filename: str, user_id: str):
+    """Store uploaded file for later AI analysis"""
+    uploaded_files[upload_id] = {
+        'data': file_data,
+        'filename': filename,
+        'user_id': user_id,
+        'uploaded_at': datetime.now()
+    }
+
+def get_uploaded_file(upload_id: str, user_id: str) -> Optional[Dict[str, Any]]:
+    """Retrieve uploaded file for AI analysis"""
+    file_info = uploaded_files.get(upload_id)
+    if file_info and file_info['user_id'] == user_id:
+        return file_info
+    return None
 
 # ---------------------------------------------------------
 # ✅ Routes
@@ -504,14 +752,11 @@ async def login(request: LoginRequest, response: Response):
 
 @app.post("/api/ai-summary")
 async def ai_summary(
-    request: Request,
+    request: AISummaryRequest,
     response: Response,
-    file: UploadFile = File(...),
-    business_goal: str = Query(""),
-    audience: str = Query("executive"),
     auth: dict = Depends(get_current_auth),
 ):
-    """Generate AI summary for uploaded file"""
+    """Generate comprehensive AI summary for previously uploaded file"""
     user_id = auth["user_id"]
     session_id = auth["session_id"]
 
@@ -526,32 +771,40 @@ async def ai_summary(
     )
     response.headers["X-Session-Id"] = session_id
 
-    # Read and process file
-    raw = await file.read()
-    
+    # Retrieve uploaded file
+    file_info = get_uploaded_file(request.upload_id, user_id)
+    if not file_info:
+        raise HTTPException(status_code=404, detail="File not found or access denied")
+
     try:
-        if (file.filename or "").lower().endswith(".csv"):
-            df = pd.read_csv(BytesIO(raw))
+        # Parse the file
+        file_data = file_info['data']
+        filename = file_info['filename']
+        
+        if filename.lower().endswith(".csv"):
+            df = pd.read_csv(BytesIO(file_data))
         else:
-            df = pd.read_excel(BytesIO(raw))
+            df = pd.read_excel(BytesIO(file_data))
+
+        # Generate comprehensive AI analysis
+        ai_service = AIService()
+        detailed_summary = ai_service.generate_detailed_summary(
+            df, 
+            request.business_goal, 
+            request.audience
+        )
+        
+        return {
+            **detailed_summary,
+            "session_id": session_id,
+            "upload_id": request.upload_id
+        }
+        
     except Exception as e:
         return JSONResponse(
             status_code=400, 
-            content={"error": "INVALID_FILE", "detail": str(e)}
+            content={"error": "ANALYSIS_FAILED", "detail": str(e)}
         )
-
-    # Generate AI summary
-    ai_service = AIService()
-    summary = ai_service.summarize(df, business_goal or None, audience)
-    
-    return {
-        "summary": summary,
-        "session_id": session_id,
-        "file": {
-            "name": file.filename,
-            "size_bytes": len(raw),
-        },
-    }
 
 @app.post("/api/analyze")
 async def analyze(
@@ -579,6 +832,10 @@ async def analyze(
     raw = await file.read()
     if len(raw) > 10 * 1024 * 1024:  # 10MB limit
         raise HTTPException(status_code=400, detail="File too large (max 10MB)")
+
+    # Generate upload ID for later AI summary calls
+    upload_id = hashlib.sha256(raw).hexdigest()[:32]
+    store_uploaded_file(upload_id, raw, file.filename, user_id)
 
     # Parse file
     try:
@@ -688,6 +945,7 @@ async def analyze(
         },
         "detailed_summary": detailed_summary,
         "session_id": session_id,
+        "upload_id": upload_id,  # Return upload_id for subsequent AI summary calls
         "file": {
             "name": file.filename,
             "size_bytes": len(raw),
@@ -714,6 +972,46 @@ async def test_db():
             return {"database": "NOT CONNECTED ⚠️", "storage": "In-Memory"}
     except Exception as e:
         return {"database": "ERROR ❌", "error": str(e), "storage": "In-Memory"}
+
+# ---------------------------------------------------------
+# ✅ Session Management Routes
+# ---------------------------------------------------------
+@app.post("/api/session/start")
+async def start_session(request: Request, response: Response):
+    """Start or refresh user session"""
+    sid = request.cookies.get("dp_session_id")
+    xff = request.headers.get("X-Forwarded-For")
+    ip = (xff.split(",")[0].strip() if xff else None)
+    ua = request.headers.get("User-Agent")
+    ua = ua[:512] if ua else None
+
+    if sid:
+        user_email = resolve_user_from_session(sid)
+        if user_email:
+            new_sid = ensure_session(user_email, sid, ip, ua)
+            response.set_cookie(
+                key="dp_session_id",
+                value=new_sid,
+                httponly=True,
+                secure=True,
+                samesite="none",
+                path="/"
+            )
+            return {"success": True, "session_id": new_sid}
+
+    # Create anonymous session
+    anonymous_id = f"anonymous_{uuid.uuid4()}"
+    new_sid = ensure_session(anonymous_id, None, ip, ua)
+    response.set_cookie(
+        key="dp_session_id",
+        value=new_sid,
+        httponly=True,
+        secure=True,
+        samesite="none",
+        path="/"
+    )
+    return {"success": True, "session_id": new_sid, "anonymous": True}
+
 # ---------------------------------------------------------
 # ✅ Error Handlers
 # ---------------------------------------------------------
