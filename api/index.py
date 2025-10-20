@@ -951,6 +951,11 @@ async def analyze(
         "numeric_columns": numeric_cols,
     }
 
+
+    # Generate AI insights
+    ai_service = AIService()
+    detailed_summary = ai_service.generate_detailed_summary(df, None, "executive")
+
     # Generate charts data
     charts = {}
     
@@ -1020,10 +1025,6 @@ async def analyze(
         "outliers_total": total_outliers,
     }
 
-    # Generate AI insights
-    ai_service = AIService()
-    detailed_summary = ai_service.generate_detailed_summary(df, None, "executive")
-
     return {
         "profiling": profiling,
         "kpis": kpis,
@@ -1041,6 +1042,7 @@ async def analyze(
             "size_bytes": len(raw),
         },
     }
+    
 
 
 @app.post("/api/auth/logout")
