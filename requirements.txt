@@ -3,7 +3,7 @@ fastapi
 uvicorn
 python-multipart
 pydantic
-
+httpx
 # Database
 pyodbc
 

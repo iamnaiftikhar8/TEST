@@ -5,6 +5,7 @@ import numpy as np
 from io import BytesIO
 import hashlib
 import uuid
+import httpx
 import bcrypt
 from datetime import datetime, date, timedelta
 from typing import Optional, Dict, Any, List, Tuple
@@ -12,7 +13,7 @@ import google.generativeai as genai
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Response, Query, Depends, status, Body
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, EmailStr
 
 # ---------------------------------------------------------
@@ -972,7 +973,162 @@ async def test_db():
             return {"database": "NOT CONNECTED ⚠️", "storage": "In-Memory"}
     except Exception as e:
         return {"database": "ERROR ❌", "error": str(e), "storage": "In-Memory"}
+@app.get("/api/auth/google")
+async def google_login():
+    """Start Google OAuth flow"""
+    client_id = "144224946029-99vhg2ds2dhfn4i98qmkj5v88fgbtnt7.apps.googleusercontent.com"
+    redirect_uri = "https://test-six-fawn-47.vercel.app/api/auth/google/callback"
+    
+    auth_url = (
+        f"https://accounts.google.com/o/oauth2/v2/auth?"
+        f"client_id={client_id}&"
+        f"response_type=code&"
+        f"scope=openid%20email%20profile&"
+        f"redirect_uri={redirect_uri}&"
+        f"access_type=offline&"
+        f"prompt=select_account"
+    )
+    
+    return RedirectResponse(auth_url)
 
+@app.get("/api/auth/google/callback")
+async def google_callback(request: Request, response: Response, code: str = None):
+    """Handle Google OAuth callback - FIXED VERSION"""
+    try:
+        if not code:
+            return RedirectResponse("https://data-pulse-one.vercel.app/login?error=no_code")
+        
+        # Exchange code for tokens
+        token_url = "https://oauth2.googleapis.com/token"
+        data = {
+            'client_id': "144224946029-99vhg2ds2dhfn4i98qmkj5v88fgbtnt7.apps.googleusercontent.com",
+            'client_secret': "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",
+            'code': code,
+            'grant_type': 'authorization_code',
+            'redirect_uri': 'https://test-six-fawn-47.vercel.app/api/auth/google/callback'
+        }
+        
+        async with httpx.AsyncClient() as client:
+            # Get access token
+            token_response = await client.post(token_url, data=data)
+            tokens = token_response.json()
+            
+            if 'error' in tokens:
+                print(f"Token error: {tokens}")
+                return RedirectResponse("https://data-pulse-one.vercel.app/login?error=auth_failed")
+            
+            # Get user info from Google
+            userinfo_response = await client.get(
+                'https://www.googleapis.com/oauth2/v3/userinfo',
+                headers={'Authorization': f"Bearer {tokens['access_token']}"}
+            )
+            user_info = userinfo_response.json()
+            
+            if 'error' in user_info:
+                print(f"Userinfo error: {user_info}")
+                return RedirectResponse("https://data-pulse-one.vercel.app/login?error=user_info_failed")
+        
+        # Extract user data
+        email = user_info['email']
+        name = user_info.get('name', 'User')
+        google_id = user_info['sub']
+        
+        print(f"Google user: {email}, {name}, {google_id}")
+        
+        # Check if user exists by email
+        existing_user = user_by_email(email)
+        
+        if existing_user:
+            # User exists - update with Google ID if needed
+            if not existing_user.get('google_id'):
+                update_user_google_id(email, google_id)
+            user_id = existing_user['email']
+        else:
+            # Create new user
+            success = create_google_user(email, name, google_id)
+            if not success:
+                return RedirectResponse("https://data-pulse-one.vercel.app/login?error=user_creation_failed")
+            user_id = email
+        
+        # Create session using your EXISTING session system
+        session_id = str(uuid.uuid4())
+        
+        # Get IP and User Agent
+        xff = request.headers.get("X-Forwarded-For")
+        client_ip = xff.split(",")[0].strip() if xff else request.client.host
+        user_agent = request.headers.get("User-Agent", "")[:512]
+        
+        # Use your existing session management - FIXED function name
+        ensure_session(user_id, session_id, client_ip, user_agent)
+        
+        # Set cookies - FIXED cookie settings
+        response.set_cookie(
+            key="session_id",  # Use your actual cookie name
+            value=session_id,
+            httponly=True,
+            secure=True,
+            samesite="none",  # FIXED: removed extra quotes
+            max_age=30 * 24 * 60 * 60,  # 30 days - FIXED: proper syntax
+            path="/"
+        )
+        
+        # Redirect to frontend - FIXED URL
+        return RedirectResponse("https://data-pulse-one.vercel.app/analyze")
+        
+    except Exception as e:
+        print(f"Google OAuth error: {e}")
+        return RedirectResponse("https://data-pulse-one.vercel.app/login?error=auth_failed")
+
+# Add these helper functions to your backend
+def create_google_user(email: str, name: str, google_id: str) -> bool:
+    """Create a user for Google OAuth"""
+    try:
+        # Try database first
+        conn = get_db_conn()
+        if conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO users (email, full_name, google_id, password_hash) VALUES (?, ?, ?, ?)",
+                (email, name, google_id, None)  # NULL password for Google users
+            )
+            conn.commit()
+            conn.close()
+            return True
+        else:
+            # Fallback to in-memory storage
+            users_db[email] = {
+                'email': email,
+                'full_name': name,
+                'google_id': google_id,
+                'password_hash': None,
+                'created_at': datetime.now().isoformat()
+            }
+            return True
+    except Exception as e:
+        print(f"User creation error: {e}")
+        # User might already exist - that's ok
+        return True
+
+def update_user_google_id(email: str, google_id: str) -> bool:
+    """Update existing user with Google ID"""
+    try:
+        conn = get_db_conn()
+        if conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE users SET google_id = ? WHERE email = ?",
+                (google_id, email)
+            )
+            conn.commit()
+            conn.close()
+        else:
+            # Update in-memory storage
+            if email in users_db:
+                users_db[email]['google_id'] = google_id
+        return True
+    except Exception as e:
+        print(f"Update user error: {e}")
+        return False
 # ---------------------------------------------------------
 # ✅ Session Management Routes
 # ---------------------------------------------------------
