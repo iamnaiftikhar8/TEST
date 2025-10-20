@@ -21,7 +21,7 @@ from pydantic import BaseModel, EmailStr
 # ---------------------------------------------------------
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://data-pulse-one.vercel.app")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyBe8E5aR-g5ecP7OThZB6S_Sg-A2RAZ3bk")
-FREE_REPORTS_PER_DAY = 50
+FREE_REPORTS_PER_DAY = 40
 
 # Database configuration
 DB_HOST = os.getenv("DB_HOST", "mssql-196323-0.cloudclusters.net")
@@ -1041,7 +1041,6 @@ async def analyze(
             "size_bytes": len(raw),
         },
     }
-    
 
 
 @app.post("/api/auth/logout")
@@ -1068,19 +1067,6 @@ async def test_db():
 # ---------------------------------------------------------
 # ✅ GOOGLE OAUTH ROUTES - COMPLETE FIXED VERSION
 # ---------------------------------------------------------
-@app.get("/api/auth/check")
-async def check_auth(request: Request):
-    """Check if user is authenticated"""
-    sid = request.cookies.get("dp_session_id")
-    if not sid:
-        return {"authenticated": False}
-    
-    user_email = resolve_user_from_session(sid)
-    if user_email:
-        return {"authenticated": True, "user_id": user_email}
-    
-    return {"authenticated": False}
-
 @app.get("/api/auth/google")
 async def google_login():
     """Start Google OAuth flow"""
