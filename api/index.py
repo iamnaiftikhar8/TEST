@@ -1184,7 +1184,8 @@ async def google_callback(request: Request, response: Response, code: str = None
             secure=True,
             samesite="none",
             max_age=30 * 24 * 60 * 60,
-            path="/"
+            path="/",
+            domain=".vercel.app" 
         )
         
         # Redirect to frontend
