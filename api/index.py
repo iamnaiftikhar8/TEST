@@ -973,6 +973,8 @@ async def test_db():
             return {"database": "NOT CONNECTED ⚠️", "storage": "In-Memory"}
     except Exception as e:
         return {"database": "ERROR ❌", "error": str(e), "storage": "In-Memory"}
+    
+    
 @app.get("/api/auth/google")
 async def google_login():
     """Start Google OAuth flow"""
