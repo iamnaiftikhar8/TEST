@@ -950,7 +950,10 @@ async def analyze(
         "dtypes": {c: str(t) for c, t in df.dtypes.items()},
         "numeric_columns": numeric_cols,
     }
-
+    # Generate AI insights
+    ai_service = AIService()
+    detailed_summary = ai_service.generate_detailed_summary(df, None, "executive")
+    
     # Generate charts data
     charts = {}
     
@@ -1020,9 +1023,7 @@ async def analyze(
         "outliers_total": total_outliers,
     }
 
-    # Generate AI insights
-    ai_service = AIService()
-    detailed_summary = ai_service.generate_detailed_summary(df, None, "executive")
+    
 
     return {
         "profiling": profiling,
