@@ -153,12 +153,13 @@ def ensure_tables():
         print(f"Database setup error: {e}")
     finally:
         conn.close()
-
+        
 def user_by_email(email: str) -> Dict[str, Any] | None:
-    """Get user by email from database - UPDATED with google_id"""
+    """Get user by email from database ONLY - no memory fallback"""
     conn = get_db_conn()
     if not conn:
-        return users_db.get(email)
+        print("❌ Database connection failed - cannot check user")
+        return None  # No memory fallback
         
     try:
         cursor = conn.cursor()
@@ -173,16 +174,37 @@ def user_by_email(email: str) -> Dict[str, Any] | None:
                 'email': row[1],
                 'full_name': row[2],
                 'password_hash': row[3],
-                'google_id': row[4],  # ADDED
+                'google_id': row[4],
                 'created_at': row[5],
                 'last_login_at': row[6]
             }
         return None
     except Exception as e:
-        print(f"Database error: {e}")
-        return users_db.get(email)
+        print(f"❌ Database query error: {e}")
+        return None  # No memory fallback
     finally:
         conn.close()
+
+def create_google_user(email: str, name: str, google_id: str) -> bool:
+    """Create a user for Google OAuth - database ONLY"""
+    try:
+        conn = get_db_conn()
+        if not conn:
+            print("❌ Database connection failed - cannot create Google user")
+            return False  # No memory fallback
+            
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO users (email, full_name, google_id, password_hash) VALUES (?, ?, ?, ?)",
+            (email, name, google_id, None)
+        )
+        conn.commit()
+        conn.close()
+        print(f"✅ Google user saved to DATABASE: {email}")
+        return True
+    except Exception as e:
+        print(f"❌ Google user creation failed: {e}")
+        return False  # No memory fallback
 
 def user_by_google_id(google_id: str) -> Dict[str, Any] | None:
     """Get user by Google ID from database - NEW FUNCTION"""
@@ -219,63 +241,34 @@ def user_by_google_id(google_id: str) -> Dict[str, Any] | None:
         conn.close()
 
 def insert_user(full_name: Optional[str], email: str, password_hash: str) -> bool:
-    """Insert new user into database"""
+    """Insert new user into database - FIXED to only use database"""
+    print(f"🔧 Attempting to insert user into database: {email}")
+    
     conn = get_db_conn()
     if not conn:
-        # Fallback to in-memory storage
-        if email in users_db:
-            return False
-        users_db[email] = {
-            'email': email,
-            'full_name': full_name,
-            'password_hash': password_hash,
-            'google_id': None,
-            'created_at': datetime.now().isoformat()
-        }
-        return True
-        
+        print("❌ Database connection failed - CANNOT create user")
+        return False  # No fallback to memory
+    
     try:
         cursor = conn.cursor()
+        print("✅ Database connected, executing INSERT...")
+        
         cursor.execute(
             "INSERT INTO users (full_name, email, password_hash, google_id) VALUES (?, ?, ?, ?)",
             (full_name, email, password_hash, None)
         )
         conn.commit()
+        print(f"✅ User successfully saved to DATABASE: {email}")
         return True
+        
     except Exception as e:
-        print(f"Database insert error: {e}")
-        return False
+        print(f"❌ Database insert FAILED: {e}")
+        return False  # No fallback to memory
+        
     finally:
         conn.close()
 
-def create_google_user(email: str, name: str, google_id: str) -> bool:
-    """Create a user for Google OAuth - NEW FUNCTION"""
-    try:
-        # Try database first
-        conn = get_db_conn()
-        if conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO users (email, full_name, google_id, password_hash) VALUES (?, ?, ?, ?)",
-                (email, name, google_id, None)  # NULL password for Google users
-            )
-            conn.commit()
-            conn.close()
-            return True
-        else:
-            # Fallback to in-memory storage
-            users_db[email] = {
-                'email': email,
-                'full_name': name,
-                'google_id': google_id,
-                'password_hash': None,
-                'created_at': datetime.now().isoformat()
-            }
-            return True
-    except Exception as e:
-        print(f"User creation error: {e}")
-        # User might already exist - that's ok
-        return True
+
 
 def update_user_google_id(email: str, google_id: str) -> bool:
     """Update existing user with Google ID - NEW FUNCTION"""
@@ -749,6 +742,56 @@ def get_uploaded_file(upload_id: str, user_id: str) -> Optional[Dict[str, Any]]:
 # ---------------------------------------------------------
 # ✅ Routes
 # ---------------------------------------------------------
+
+@app.get("/api/debug/users")
+async def debug_users():
+    """Debug endpoint to see all users in database"""
+    conn = get_db_conn()
+    if not conn:
+        return {"storage": "in_memory", "users": users_db}
+    
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, email, full_name, created_at FROM users")
+        rows = cursor.fetchall()
+        users = []
+        for row in rows:
+            users.append({
+                'id': row[0],
+                'email': row[1],
+                'full_name': row[2],
+                'created_at': row[3].isoformat() if row[3] else None
+            })
+        return {"storage": "database", "users": users}
+    except Exception as e:
+        return {"error": str(e), "storage": "in_memory", "users": users_db}
+    finally:
+        conn.close()
+        
+@app.get("/api/debug/db-status")
+
+async def debug_db_status():
+    """Check database connection status"""
+    try:
+        conn = get_db_conn()
+        if conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT @@version as version")
+            version = cursor.fetchone()
+            cursor.execute("SELECT COUNT(*) as user_count FROM users")
+            count = cursor.fetchone()
+            conn.close()
+            return {
+                "status": "connected",
+                "database": "SQL Server",
+                "version": version[0] if version else "unknown",
+                "user_count": count[0] if count else 0
+            }
+        else:
+            return {"status": "disconnected", "storage": "in_memory", "user_count": len(users_db)}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+    
 @app.get("/")
 async def root():
     return {"status": "success", "message": "DataPulse API running on Vercel", "version": "1.0.0"}
