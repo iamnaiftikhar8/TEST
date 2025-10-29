@@ -11,7 +11,7 @@ pyodbc
 pandas
 numpy
 openpyxl
-
+xlrd
 # Authentication
 bcrypt
 
