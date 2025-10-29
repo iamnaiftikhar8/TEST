@@ -21,7 +21,7 @@ from pydantic import BaseModel, EmailStr
 # ---------------------------------------------------------
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://data-pulse-one.vercel.app")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyBe8E5aR-g5ecP7OThZB6S_Sg-A2RAZ3bk")
-FREE_REPORTS_PER_DAY = 1
+FREE_REPORTS_PER_DAY = 3
 
 # Database configuration
 DB_HOST = os.getenv("DB_HOST", "mssql-196323-0.cloudclusters.net")
@@ -339,7 +339,7 @@ def user_by_email(email: str) -> Dict[str, Any] | None:
         conn.close()
 
 def user_by_google_id(google_id: str) -> Dict[str, Any] | None:
-    """Get user by Google ID from database - NEW FUNCTION"""
+    """Get user by Google ID from database with proper error handling"""
     conn = get_db_conn()
     if not conn:
         # Check in-memory storage
@@ -356,7 +356,7 @@ def user_by_google_id(google_id: str) -> Dict[str, Any] | None:
         )
         row = cursor.fetchone()
         if row:
-            return {
+            user_data = {
                 'id': row[0],
                 'email': row[1],
                 'full_name': row[2],
@@ -365,12 +365,15 @@ def user_by_google_id(google_id: str) -> Dict[str, Any] | None:
                 'created_at': row[5],
                 'last_login_at': row[6]
             }
+            conn.close()
+            return user_data
+        conn.close()
         return None
     except Exception as e:
-        print(f"Database error: {e}")
+        print(f"❌ Database error in user_by_google_id: {e}")
+        if conn:
+            conn.close()
         return None
-    finally:
-        conn.close()
 
 def insert_user(full_name: Optional[str], email: str, password_hash: str) -> bool:
     """Insert new user into database with local time"""
@@ -405,19 +408,28 @@ def insert_user(full_name: Optional[str], email: str, password_hash: str) -> boo
         conn.close()
 
 def create_google_user(email: str, name: str, google_id: str) -> bool:
-    """Create a user for Google OAuth with local time"""
+    """Create a user for Google OAuth with proper error handling"""
     try:
-        # Try database first
         conn = get_db_conn()
         if conn:
             cursor = conn.cursor()
             current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+            
+            # Check if user already exists (double check)
+            cursor.execute("SELECT id FROM users WHERE email = ? OR google_id = ?", (email, google_id))
+            if cursor.fetchone():
+                print(f"⚠️ User already exists: {email}")
+                conn.close()
+                return True
+                
+            # Insert new user
             cursor.execute(
                 "INSERT INTO users (email, full_name, google_id, password_hash, created_at) VALUES (?, ?, ?, ?, ?)",
                 (email, name, google_id, None, current_time)  # NULL password for Google users
             )
             conn.commit()
             conn.close()
+            print(f"✅ Created new Google user in database: {email}")
             return True
         else:
             # Fallback to in-memory storage
@@ -428,14 +440,23 @@ def create_google_user(email: str, name: str, google_id: str) -> bool:
                 'password_hash': None,
                 'created_at': datetime.now().isoformat()
             }
+            print(f"✅ Created new Google user in memory: {email}")
             return True
     except Exception as e:
-        print(f"User creation error: {e}")
-        # User might already exist - that's ok
+        print(f"❌ User creation error: {e}")
+        # If database fails, try in-memory
+        users_db[email] = {
+            'email': email,
+            'full_name': name,
+            'google_id': google_id,
+            'password_hash': None,
+            'created_at': datetime.now().isoformat()
+        }
         return True
 
+
 def update_user_google_id(email: str, google_id: str) -> bool:
-    """Update existing user with Google ID - NEW FUNCTION"""
+    """Update existing user with Google ID with proper error handling"""
     try:
         conn = get_db_conn()
         if conn:
@@ -446,14 +467,17 @@ def update_user_google_id(email: str, google_id: str) -> bool:
             )
             conn.commit()
             conn.close()
+            print(f"✅ Updated user with Google ID: {email}")
         else:
             # Update in-memory storage
             if email in users_db:
                 users_db[email]['google_id'] = google_id
         return True
     except Exception as e:
-        print(f"Update user error: {e}")
+        print(f"❌ Update user error: {e}")
         return False
+
+
 def cleanup_expired_sessions() -> int:
     """Clean up expired sessions and deactivate duplicates"""
     conn = get_db_conn()
@@ -1863,13 +1887,27 @@ async def analyze(
 
     outlier_counts = {c: _iqr_outliers(numeric_df[c]) for c in numeric_df.columns} if not numeric_df.empty else {}
     total_outliers = int(sum(outlier_counts.values()))
-
+    rows_per_day = None
+    date_cols = df.select_dtypes(include=['datetime64']).columns.tolist()
+    if date_cols:
+      try:
+        # Use first date column
+        date_col = date_cols[0]
+        # Count unique days and calculate average rows per day
+        unique_days = df[date_col].dt.normalize().nunique()
+        if unique_days > 0:
+            rows_per_day = round(len(df) / unique_days, 1)
+      except Exception as e:
+        print(f"Rows per day calculation error: {e}")
+        
     kpis = {
         "total_rows": int(df.shape[0]),
         "total_columns": int(df.shape[1]),
         "missing_pct": _safe_float(missing_pct),
         "duplicate_rows": duplicates,
         "outliers_total": total_outliers,
+        "rows_per_day": rows_per_day # ✅ ADD THIS LINE
+
     }
 
     # Generate AI insights and visualizations
@@ -2067,7 +2105,7 @@ async def google_login():
 
 @app.get("/api/auth/google/callback")
 async def google_callback(request: Request, response: Response, code: str = None):
-    """Handle Google OAuth callback with local time"""
+    """Handle Google OAuth callback with proper session management"""
     try:
         if not code:
             return RedirectResponse(f"{FRONTEND_URL}/login?error=no_code")
@@ -2117,11 +2155,13 @@ async def google_callback(request: Request, response: Response, code: str = None
             if existing_user:
                 # Update existing user with Google ID
                 update_user_google_id(email, google_id)
+                print(f"✅ Updated existing user with Google ID: {email}")
             else:
                 # Create new Google user
                 if not create_google_user(email, name, google_id):
                     return RedirectResponse(f"{FRONTEND_URL}/login?error=user_creation_failed")
                 existing_user = user_by_google_id(google_id)
+                print(f"✅ Created new Google user: {email}")
         
         user_id = existing_user['email']
         
@@ -2130,13 +2170,17 @@ async def google_callback(request: Request, response: Response, code: str = None
         client_ip = xff.split(",")[0].strip() if xff else request.client.host
         user_agent = request.headers.get("User-Agent", "")[:512]
         
-        # Update last login with local time
+        # Update last login
         update_user_last_login(user_id)
         
-        # Create session with local time
+        # Create session - IMPORTANT: Use the same ensure_session function
         session_id = ensure_session(user_id, None, client_ip, user_agent)
         
-        # Set cookies
+        if not session_id:
+            print(f"❌ Session creation failed for user: {user_id}")
+            return RedirectResponse(f"{FRONTEND_URL}/login?error=session_failed")
+        
+        # Set cookies - FIXED: Use proper cookie settings
         response.set_cookie(
             key="dp_session_id",
             value=session_id,
@@ -2147,13 +2191,18 @@ async def google_callback(request: Request, response: Response, code: str = None
             path="/",
         )
         
+        # Also set in response headers for frontend
+        response.headers["X-Session-Id"] = session_id
+        
         print(f"✅ Google OAuth successful for {email}, session: {session_id}")
         
-        # Redirect to analyze page
-        return RedirectResponse(f"{FRONTEND_URL}/analyze")
+        # Redirect to analyze page with session
+        return RedirectResponse(f"{FRONTEND_URL}/analyze?session={session_id}")
         
     except Exception as e:
-        print(f"Google OAuth error: {e}")
+        print(f"❌ Google OAuth error: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return RedirectResponse(f"{FRONTEND_URL}/login?error=auth_failed")
     
 @app.get("/api/usage/stats")
