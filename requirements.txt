@@ -6,7 +6,6 @@ pydantic
 httpx
 # Database
 pyodbc
-turbodbc
 pymssql
 # Data Processing
 pandas

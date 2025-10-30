@@ -96,13 +96,6 @@ class AISummaryRequest(BaseModel):
     include_predictions: bool = True
     include_benchmarks: bool = True
     include_risk_assessment: bool = True
-
-## ---------------------------------------------------------
-# ✅ Database Functions - COMPLETE SESSION MANAGEMENT
-# ---------------------------------------------------------
-## ---------------------------------------------------------
-# ✅ Database Functions - COMPLETE SESSION MANAGEMENT (Vercel Compatible)
-# ---------------------------------------------------------
 ## ---------------------------------------------------------
 # ✅ Database Functions - COMPLETE SESSION MANAGEMENT (Pure Python)
 # ---------------------------------------------------------
@@ -111,12 +104,7 @@ try:
     print("✅ pymssql imported successfully - Pure Python solution")
 except ImportError as e:
     print(f"❌ pymssql import failed: {e}")
-    try:
-        import turbodbc as db_lib
-        print("✅ turbodbc imported - Vercel compatible")
-    except ImportError as e:
-        print(f"❌ turbodbc import failed: {e}")
-        db_lib = None
+    db_lib = None
 
 def get_db_conn():
     if not db_lib:
@@ -126,23 +114,15 @@ def get_db_conn():
     try:
         print(f"🔗 Attempting database connection to {DB_HOST}:{DB_PORT}")
         
-        if 'pymssql' in str(db_lib):
-            # pymssql connection (pure Python - most compatible)
-            conn = db_lib.connect(
-                server=DB_HOST,
-                port=int(DB_PORT),
-                user=DB_UID, 
-                password=DB_PWD,
-                database=DB_NAME,
-                timeout=30
-            )
-        elif 'turbodbc' in str(db_lib):
-            # turbodbc connection
-            conn_str = f"DRIVER={{ODBC Driver 18 for SQL Server}};SERVER={DB_HOST},{DB_PORT};DATABASE={DB_NAME};UID={DB_UID};PWD={DB_PWD};Encrypt=yes;TrustServerCertificate=yes;"
-            conn = db_lib.connect(connection_string=conn_str)
-        else:
-            print("❌ Unsupported database library")
-            return None
+        # pymssql connection (pure Python - most compatible)
+        conn = db_lib.connect(
+            server=DB_HOST,
+            port=int(DB_PORT),
+            user=DB_UID, 
+            password=DB_PWD,
+            database=DB_NAME,
+            timeout=30
+        )
             
         print("✅ Database connection successful")
         return conn
