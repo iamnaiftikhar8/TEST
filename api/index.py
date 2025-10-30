@@ -73,6 +73,7 @@ file_storage = {}
 user_usage = {}
 users_db = {}
 uploaded_files = {}  # Store uploaded files for AI summary
+user_reports = {}  # user_id -> {date -> count}  # ADD THIS LINE
 
 # ---------------------------------------------------------
 # ✅ Models
@@ -96,8 +97,8 @@ class AISummaryRequest(BaseModel):
     include_benchmarks: bool = True
     include_risk_assessment: bool = True
 
-# ---------------------------------------------------------
-# ✅ Database Functions - UPDATED FOR FILE STORAGE
+## ---------------------------------------------------------
+# ✅ Database Functions - COMPLETE SESSION MANAGEMENT
 # ---------------------------------------------------------
 try:
     import pyodbc as db_lib
@@ -113,7 +114,7 @@ def get_db_conn():
     return None
 
 def ensure_tables():
-    """Create necessary tables if they don't exist - UPDATED with uploaded_files table"""
+    """Create necessary tables if they don't exist - COMPLETE SESSION MANAGEMENT"""
     conn = get_db_conn()
     if not conn:
         return
@@ -121,22 +122,24 @@ def ensure_tables():
     try:
         cursor = conn.cursor()
         
-        # Users table - UPDATED with google_id
+        # Users table
         cursor.execute("""
         IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='users' AND xtype='U')
         CREATE TABLE users (
             id INT IDENTITY PRIMARY KEY,
             email NVARCHAR(256) NOT NULL UNIQUE,
             full_name NVARCHAR(200) NULL,
-            password_hash NVARCHAR(200) NULL,  -- NULL for Google users
-            google_id NVARCHAR(128) NULL,      -- ADDED for Google OAuth
+            password_hash NVARCHAR(200) NULL,
+            google_id NVARCHAR(128) NULL,
             created_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
-            last_login_at DATETIME2 NULL
+            last_login_at DATETIME2 NULL,
+            is_premium BIT NOT NULL DEFAULT 0,
+            is_admin BIT NOT NULL DEFAULT 0,  -- ✅ NEW: Admin flag
+            premium_expires_at DATETIME2 NULL
         )
         """)
         
-        # User sessions table
-        # ✅ FIXED: User sessions table with proper columns
+        # User sessions table - ENHANCED
         cursor.execute("""
         IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='user_sessions' AND xtype='U')
         CREATE TABLE user_sessions (
@@ -147,11 +150,26 @@ def ensure_tables():
             expires_at DATETIME2 NOT NULL DEFAULT DATEADD(HOUR, 24, SYSDATETIME()),
             ip NVARCHAR(64) NULL,
             user_agent NVARCHAR(512) NULL,
-            is_active BIT NOT NULL DEFAULT 1
+            is_active BIT NOT NULL DEFAULT 1,
+            login_method NVARCHAR(20) NOT NULL DEFAULT 'email'  -- 'email' or 'google'
         )
         """)
         
-        # Uploaded files table - NEW TABLE for file storage
+        # User reports table - NEW: Track report usage
+        cursor.execute("""
+        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='user_reports' AND xtype='U')
+        CREATE TABLE user_reports (
+            id INT IDENTITY PRIMARY KEY,
+            user_id NVARCHAR(128) NOT NULL,
+            report_date DATE NOT NULL,
+            report_count INT NOT NULL DEFAULT 0,
+            last_report_at DATETIME2 NULL,
+            created_at DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
+            UNIQUE (user_id, report_date)
+        )
+        """)
+        
+        # Uploaded files table
         cursor.execute("""
         IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='uploaded_files' AND xtype='U')
         CREATE TABLE uploaded_files (
@@ -169,147 +187,259 @@ def ensure_tables():
         """)
         
         conn.commit()
+        print("✅ Database tables ensured")
     except Exception as e:
         print(f"Database setup error: {e}")
     finally:
         conn.close()
-# Add these functions to your database functions section
 
-def check_usage_limit(user_id: str) -> bool:
-    """Check if user has reached daily usage limit"""
+# ---------------------------------------------------------
+# ✅ USAGE LIMIT MANAGEMENT
+# ---------------------------------------------------------
+
+def check_report_eligibility(user_id: str) -> Dict[str, Any]:
+    """
+    Check if user can generate a report
+    Returns: {
+        "can_generate": bool,
+        "reason": str,
+        "next_available": datetime | None,
+        "is_premium": bool,
+        "is_admin": bool  # ✅ NEW
+
+    }
+    """
     conn = get_db_conn()
     if not conn:
-        # Fallback to in-memory storage
+        # Fallback to in-memory (for development)
         today = date.today().isoformat()
-        user_today_usage = user_usage.get(user_id, {}).get(today, 0)
-        return user_today_usage < FREE_REPORTS_PER_DAY
+        user_today_reports = user_reports.get(user_id, {}).get(today, 0)
+        
+          # ✅ CHECK IN-MEMORY ADMIN STATUS
+        user_data = users_db.get(user_id, {})
+        is_admin = user_data.get('is_admin', False)
+        
+        can_generate = user_today_reports < 1
+        return {
+            "can_generate": can_generate,
+            "reason": "DAILY_LIMIT_REACHED" if not can_generate else "ELIGIBLE",
+            "next_available": None if can_generate else datetime.now() + timedelta(days=1),
+            "is_premium": False,
+            "is_admin": is_admin  # ✅ ADD THIS
+
+        }
         
     try:
         cursor = conn.cursor()
+        
+        # ✅ CHECK IF USER IS ADMIN
+        cursor.execute(
+            "SELECT is_premium, premium_expires_at, is_admin FROM users WHERE email = ?",
+            (user_id,)
+        )
+        user_row = cursor.fetchone()
+        
+        is_premium = user_row[0] if user_row else False
+        premium_expires = user_row[1] if user_row else None
+        is_admin = user_row[2] if user_row else False  # ✅ GET ADMIN STATUS
+        
+        # ✅ ADMIN USERS HAVE UNLIMITED REPORTS
+        if is_admin:
+            return {
+                "can_generate": True,
+                "reason": "ADMIN_USER",
+                "next_available": None,
+                "is_premium": is_premium,
+                "is_admin": True
+            }
+        
+        # Premium users with valid subscription have unlimited reports
+        if is_premium and premium_expires and premium_expires > datetime.now():
+            return {
+                "can_generate": True,
+                "reason": "PREMIUM_USER",
+                "next_available": None,
+                "is_premium": True,
+                "is_admin": False
+            }
         today = date.today()
         
-        # Check if user exists in usage table
-        cursor.execute("""
-        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='user_usage' AND xtype='U')
-        CREATE TABLE user_usage (
-            id INT IDENTITY PRIMARY KEY,
-            user_id NVARCHAR(128) NOT NULL,
-            usage_date DATE NOT NULL,
-            report_count INT NOT NULL DEFAULT 0,
-            created_at DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
-            UNIQUE (user_id, usage_date)
-        )
-        """)
-        
-        # Get today's usage
+        # Check if user is premium
         cursor.execute(
-            "SELECT report_count FROM user_usage WHERE user_id = ? AND usage_date = ?",
+            "SELECT is_premium, premium_expires_at FROM users WHERE email = ?",
+            (user_id,)
+        )
+        user_row = cursor.fetchone()
+        is_premium = user_row[0] if user_row else False
+        premium_expires = user_row[1] if user_row else None
+        
+        # Premium users have unlimited reports
+        if is_premium and premium_expires and premium_expires > datetime.now():
+            return {
+                "can_generate": True,
+                "reason": "PREMIUM_USER",
+                "next_available": None,
+                "is_premium": True
+            }
+        
+        # Check today's report count
+        cursor.execute(
+            "SELECT report_count, last_report_at FROM user_reports WHERE user_id = ? AND report_date = ?",
             (user_id, today)
         )
         row = cursor.fetchone()
         
         if row:
-            return row[0] < FREE_REPORTS_PER_DAY
+            report_count, last_report_at = row
+            if report_count >= 1:
+                # Calculate next available time (24 hours from last report)
+                next_available = last_report_at + timedelta(hours=24)
+                if datetime.now() < next_available:
+                    return {
+                        "can_generate": False,
+                        "reason": "DAILY_LIMIT_REACHED",
+                        "next_available": next_available,
+                        "is_premium": False,
+                        "is_admin": False
+
+                    }
+                else:
+                    # Reset count if 24 hours have passed
+                    cursor.execute(
+                        "UPDATE user_reports SET report_count = 0 WHERE user_id = ? AND report_date = ?",
+                        (user_id, today)
+                    )
+                    conn.commit()
+                    return {
+                        "can_generate": True,
+                        "reason": "ELIGIBLE",
+                        "next_available": None,
+                        "is_premium": False,
+                       "is_admin": False
+
+                    }
+            else:
+                return {
+                    "can_generate": True,
+                    "reason": "ELIGIBLE",
+                    "next_available": None,
+                    "is_premium": False,
+                    "is_admin": False
+
+                }
         else:
-            # No usage today, so within limit
-            return True
+            # No reports today
+            return {
+                "can_generate": True,
+                "reason": "ELIGIBLE",
+                "next_available": None,
+                "is_premium": False,
+                "is_admin": False
+
+            }
             
     except Exception as e:
-        print(f"Usage check error: {e}")
-        return True
+        print(f"Report eligibility error: {e}")
+        return {
+            "can_generate": True,  # Fail open for errors
+            "reason": "ERROR",
+            "next_available": None,
+            "is_premium": False,
+            "is_admin": False
+
+        }
     finally:
         conn.close()
 
-def increment_usage_count(user_id: str) -> bool:
-    """Increment user's daily usage count"""
+def increment_report_count(user_id: str) -> bool:
+    """Increment user's report count for today"""
     conn = get_db_conn()
     if not conn:
         # Fallback to in-memory storage
         today = date.today().isoformat()
-        if user_id not in user_usage:
-            user_usage[user_id] = {}
-        user_usage[user_id][today] = user_usage[user_id].get(today, 0) + 1
+        if user_id not in user_reports:
+            user_reports[user_id] = {}
+        user_reports[user_id][today] = user_reports[user_id].get(today, 0) + 1
         return True
         
     try:
         cursor = conn.cursor()
         today = date.today()
+        current_time = datetime.now()
         
-        # Insert or update usage count
+        # Insert or update report count
         cursor.execute("""
-        MERGE user_usage AS target
-        USING (SELECT ? AS user_id, ? AS usage_date) AS source
-        ON target.user_id = source.user_id AND target.usage_date = source.usage_date
+        MERGE user_reports AS target
+        USING (SELECT ? AS user_id, ? AS report_date) AS source
+        ON target.user_id = source.user_id AND target.report_date = source.report_date
         WHEN MATCHED THEN
-            UPDATE SET report_count = report_count + 1
+            UPDATE SET report_count = report_count + 1, last_report_at = ?
         WHEN NOT MATCHED THEN
-            INSERT (user_id, usage_date, report_count) VALUES (?, ?, 1);
-        """, (user_id, today, user_id, today))
+            INSERT (user_id, report_date, report_count, last_report_at) VALUES (?, ?, 1, ?);
+        """, (user_id, today, current_time, user_id, today, current_time))
         
         conn.commit()
         return True
     except Exception as e:
-        print(f"Increment usage error: {e}")
+        print(f"Increment report count error: {e}")
         return False
     finally:
         conn.close()
-        
-def get_usage_stats(user_id: str) -> Dict[str, Any]:
-    """Get user's current usage statistics"""
+
+def get_user_report_stats(user_id: str) -> Dict[str, Any]:
+    """Get user's report statistics"""
+    eligibility = check_report_eligibility(user_id)
+    
     conn = get_db_conn()
     if not conn:
-        # Fallback to in-memory storage
-        today = date.today().isoformat()
-        today_usage = user_usage.get(user_id, {}).get(today, 0)
         return {
-            "today_usage": today_usage,
-            "daily_limit": FREE_REPORTS_PER_DAY,
-            "remaining": FREE_REPORTS_PER_DAY - today_usage
+            "can_generate": eligibility["can_generate"],
+            "reason": eligibility["reason"],
+            "next_available": eligibility["next_available"],
+            "is_premium": eligibility["is_premium"],
+            "is_admin": eligibility["is_admin"],  # ✅ ADD THIS
+            "today_used": user_reports.get(user_id, {}).get(date.today().isoformat(), 0),
+            "daily_limit": 1
         }
         
     try:
         cursor = conn.cursor()
         today = date.today()
         
-        # First ensure the table exists
-        cursor.execute("""
-        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='user_usage' AND xtype='U')
-        CREATE TABLE user_usage (
-            id INT IDENTITY PRIMARY KEY,
-            user_id NVARCHAR(128) NOT NULL,
-            usage_date DATE NOT NULL,
-            report_count INT NOT NULL DEFAULT 0,
-            created_at DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
-            UNIQUE (user_id, usage_date)
-        )
-        """)
-        
-        # Get today's usage
         cursor.execute(
-            "SELECT report_count FROM user_usage WHERE user_id = ? AND usage_date = ?",
+            "SELECT report_count FROM user_reports WHERE user_id = ? AND report_date = ?",
             (user_id, today)
         )
         row = cursor.fetchone()
-        
-        today_usage = row[0] if row else 0
+        today_used = row[0] if row else 0
         
         return {
-            "today_usage": today_usage,
-            "daily_limit": FREE_REPORTS_PER_DAY,
-            "remaining": FREE_REPORTS_PER_DAY - today_usage
+            "can_generate": eligibility["can_generate"],
+            "reason": eligibility["reason"],
+            "next_available": eligibility["next_available"],
+            "is_premium": eligibility["is_premium"],
+            "today_used": today_used,
+            "daily_limit": "∞" if eligibility["is_admin"] else 1  # ✅ SHOW INFINITY FOR ADMINS
         }
     except Exception as e:
-        print(f"Get usage stats error: {e}")
+        print(f"Get report stats error: {e}")
         return {
-            "today_usage": 0,
-            "daily_limit": FREE_REPORTS_PER_DAY,
-            "remaining": FREE_REPORTS_PER_DAY
+            "can_generate": True,
+            "reason": "ERROR",
+            "next_available": None,
+            "is_premium": False,
+            "today_used": 0,
+            "daily_limit": 1
         }
     finally:
         conn.close()
-        
+
+# ---------------------------------------------------------
+# ✅ USER MANAGEMENT FUNCTIONS
+# ---------------------------------------------------------
+
 def user_by_email(email: str) -> Dict[str, Any] | None:
-    """Get user by email from database - UPDATED with google_id"""
+    """Get user by email from database"""
     conn = get_db_conn()
     if not conn:
         return users_db.get(email)
@@ -317,7 +447,7 @@ def user_by_email(email: str) -> Dict[str, Any] | None:
     try:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT id, email, full_name, password_hash, google_id, created_at, last_login_at FROM users WHERE email = ?",
+            "SELECT id, email, full_name, password_hash, google_id, created_at, last_login_at, is_premium FROM users WHERE email = ?",
             (email,)
         )
         row = cursor.fetchone()
@@ -327,9 +457,10 @@ def user_by_email(email: str) -> Dict[str, Any] | None:
                 'email': row[1],
                 'full_name': row[2],
                 'password_hash': row[3],
-                'google_id': row[4],  # ADDED
+                'google_id': row[4],
                 'created_at': row[5],
-                'last_login_at': row[6]
+                'last_login_at': row[6],
+                'is_premium': row[7]
             }
         return None
     except Exception as e:
@@ -339,10 +470,9 @@ def user_by_email(email: str) -> Dict[str, Any] | None:
         conn.close()
 
 def user_by_google_id(google_id: str) -> Dict[str, Any] | None:
-    """Get user by Google ID from database - NEW FUNCTION"""
+    """Get user by Google ID from database"""
     conn = get_db_conn()
     if not conn:
-        # Check in-memory storage
         for user in users_db.values():
             if user.get('google_id') == google_id:
                 return user
@@ -351,7 +481,7 @@ def user_by_google_id(google_id: str) -> Dict[str, Any] | None:
     try:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT id, email, full_name, password_hash, google_id, created_at, last_login_at FROM users WHERE google_id = ?",
+            "SELECT id, email, full_name, password_hash, google_id, created_at, last_login_at, is_premium FROM users WHERE google_id = ?",
             (google_id,)
         )
         row = cursor.fetchone()
@@ -363,7 +493,8 @@ def user_by_google_id(google_id: str) -> Dict[str, Any] | None:
                 'password_hash': row[3],
                 'google_id': row[4],
                 'created_at': row[5],
-                'last_login_at': row[6]
+                'last_login_at': row[6],
+                'is_premium': row[7]
             }
         return None
     except Exception as e:
@@ -373,10 +504,13 @@ def user_by_google_id(google_id: str) -> Dict[str, Any] | None:
         conn.close()
 
 def insert_user(full_name: Optional[str], email: str, password_hash: str) -> bool:
-    """Insert new user into database with local time"""
+    """Insert new user into database with admin check"""
     conn = get_db_conn()
+    
+    # ✅ CHECK FOR ADMIN EMAIL
+    is_admin = check_if_admin_email(email)
+    
     if not conn:
-        # Fallback to in-memory storage
         if email in users_db:
             return False
         users_db[email] = {
@@ -384,17 +518,18 @@ def insert_user(full_name: Optional[str], email: str, password_hash: str) -> boo
             'full_name': full_name,
             'password_hash': password_hash,
             'google_id': None,
-            'created_at': datetime.now().isoformat()
+            'created_at': datetime.now().isoformat(),
+            'is_premium': False,
+            'is_admin': is_admin  # ✅ ADD ADMIN FLAG
         }
         return True
         
     try:
         cursor = conn.cursor()
-        # Use explicit local time instead of relying on default
         current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
         cursor.execute(
-            "INSERT INTO users (full_name, email, password_hash, google_id, created_at) VALUES (?, ?, ?, ?, ?)",
-            (full_name, email, password_hash, None, current_time)
+            "INSERT INTO users (full_name, email, password_hash, google_id, created_at, is_admin) VALUES (?, ?, ?, ?, ?, ?)",
+            (full_name, email, password_hash, None, current_time, is_admin)  # ✅ ADD is_admin
         )
         conn.commit()
         return True
@@ -405,37 +540,80 @@ def insert_user(full_name: Optional[str], email: str, password_hash: str) -> boo
         conn.close()
 
 def create_google_user(email: str, name: str, google_id: str) -> bool:
-    """Create a user for Google OAuth with local time"""
+    """Create a user for Google OAuth with admin check"""
     try:
-        # Try database first
+        # ✅ CHECK FOR ADMIN EMAIL
+        is_admin = check_if_admin_email(email)
+        
+        conn = get_db_conn()
+        if conn:
+            cursor = conn.cursor()
+            current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+            cursor.execute(
+                "INSERT INTO users (email, full_name, google_id, password_hash, created_at, is_admin) VALUES (?, ?, ?, ?, ?, ?)",
+                (email, name, google_id, None, current_time, is_admin)  # ✅ ADD is_admin
+            )
+            conn.commit()
+            conn.close()
+            return True
+        else:
+            users_db[email] = {
+                'email': email,
+                'full_name': name,
+                'google_id': google_id,
+                'password_hash': None,
+                'created_at': datetime.now().isoformat(),
+                'is_premium': False,
+                'is_admin': is_admin  # ✅ ADD ADMIN FLAG
+            }
+            return True
+    except Exception as e:
+        print(f"User creation error: {e}")
+        return True
+
+def check_if_admin_email(email: str) -> bool:
+    """Check if email is in the admin whitelist"""
+    admin_emails = {
+        "gms-world@gmail.com",
+        "admin@datapulse.com", 
+        "developer@datapulse.com",
+        "sap.admin@gms-world.com"
+        # Add more admin emails here
+    }
+    
+    # Case-insensitive check
+    return email.lower().strip() in {admin_email.lower() for admin_email in admin_emails}
+
+def create_google_user(email: str, name: str, google_id: str) -> bool:
+    """Create a user for Google OAuth"""
+    try:
         conn = get_db_conn()
         if conn:
             cursor = conn.cursor()
             current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
             cursor.execute(
                 "INSERT INTO users (email, full_name, google_id, password_hash, created_at) VALUES (?, ?, ?, ?, ?)",
-                (email, name, google_id, None, current_time)  # NULL password for Google users
+                (email, name, google_id, None, current_time)
             )
             conn.commit()
             conn.close()
             return True
         else:
-            # Fallback to in-memory storage
             users_db[email] = {
                 'email': email,
                 'full_name': name,
                 'google_id': google_id,
                 'password_hash': None,
-                'created_at': datetime.now().isoformat()
+                'created_at': datetime.now().isoformat(),
+                'is_premium': False
             }
             return True
     except Exception as e:
         print(f"User creation error: {e}")
-        # User might already exist - that's ok
         return True
 
 def update_user_google_id(email: str, google_id: str) -> bool:
-    """Update existing user with Google ID - NEW FUNCTION"""
+    """Update existing user with Google ID"""
     try:
         conn = get_db_conn()
         if conn:
@@ -447,211 +625,17 @@ def update_user_google_id(email: str, google_id: str) -> bool:
             conn.commit()
             conn.close()
         else:
-            # Update in-memory storage
             if email in users_db:
                 users_db[email]['google_id'] = google_id
         return True
     except Exception as e:
         print(f"Update user error: {e}")
         return False
-def cleanup_expired_sessions() -> int:
-    """Clean up expired sessions and deactivate duplicates"""
-    conn = get_db_conn()
-    current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
-    
-    if not conn:
-        # Clean in-memory storage
-        expired_count = 0
-        for session_id, session_data in list(user_sessions.items()):
-            if isinstance(session_data, dict):
-                if datetime.now() - session_data.get('created_at', datetime.now()) >= timedelta(hours=24):
-                    del user_sessions[session_id]
-                    expired_count += 1
-        return expired_count
-        
-    try:
-        cursor = conn.cursor()
-        
-        # First, deactivate duplicate active sessions for same user
-        cursor.execute("""
-            WITH RankedSessions AS (
-                SELECT session_id, user_id, last_accessed,
-                       ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY last_accessed DESC) as rn
-                FROM user_sessions 
-                WHERE is_active = 1 AND expires_at > ?
-            )
-            UPDATE user_sessions 
-            SET is_active = 0 
-            WHERE session_id IN (
-                SELECT session_id FROM RankedSessions WHERE rn > 1
-            )
-        """, (current_time,))
-        duplicate_count = cursor.rowcount
-        
-        # Then delete truly expired sessions
-        cursor.execute("DELETE FROM user_sessions WHERE expires_at <= ?", (current_time,))
-        expired_count = cursor.rowcount
-        
-        conn.commit()
-        print(f"🧹 Cleaned up {expired_count} expired sessions and {duplicate_count} duplicates")
-        return expired_count + duplicate_count
-    except Exception as e:
-        print(f"Session cleanup error: {e}")
-        return 0
-    finally:
-        if conn:
-            conn.close()
-        
-def ensure_session(user_id: str, session_id: Optional[str], ip: Optional[str], ua: Optional[str]) -> str:
-    """FIXED: Ensure session exists with proper duplicate prevention"""
-    conn = get_db_conn()
-    
-    # Get current local time
-    current_time = datetime.now()
-    expires_time = current_time + timedelta(hours=24)
-    
-    # Format for SQL Server
-    current_time_str = current_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
-    expires_time_str = expires_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
-    
-    if not conn:
-        # Fallback to in-memory storage
-        if session_id and session_id in user_sessions:
-            user_sessions[session_id]['last_accessed'] = current_time
-            return session_id
-        new_sid = str(uuid.uuid4())
-        user_sessions[new_sid] = {
-            'user_id': user_id,
-            'created_at': current_time,
-            'last_accessed': current_time
-        }
-        return new_sid
-        
-    try:
-        cursor = conn.cursor()
-        
-        # 🚨 FIX: Check if session exists and is valid - PROPERLY
-        if session_id:
-            cursor.execute(
-                """SELECT session_id FROM user_sessions 
-                   WHERE session_id = ? AND is_active = 1 AND expires_at > ?""",
-                (session_id, current_time_str)
-            )
-            existing_session = cursor.fetchone()
-            
-            if existing_session:
-                # ✅ UPDATE existing session instead of creating new one
-                cursor.execute(
-                    """UPDATE user_sessions 
-                       SET last_accessed = ?, expires_at = ?
-                       WHERE session_id = ?""",
-                    (current_time_str, expires_time_str, session_id)
-                )
-                conn.commit()
-                conn.close()
-             #   print(f"✅ Updated existing session: {session_id}")
-                return session_id
-        
-        # 🚨 FIX: Check for existing active sessions for this user
-        cursor.execute(
-            """SELECT session_id FROM user_sessions 
-               WHERE user_id = ? AND is_active = 1 AND expires_at > ?
-               ORDER BY last_accessed DESC""",
-            (user_id, current_time_str)
-        )
-        existing_user_sessions = cursor.fetchall()
-        
-        # If user has existing active sessions, use the most recent one
-        if existing_user_sessions:
-            existing_session_id = existing_user_sessions[0][0]
-            # Update the existing session
-            cursor.execute(
-                """UPDATE user_sessions 
-                   SET last_accessed = ?, expires_at = ?, ip = ?, user_agent = ?
-                   WHERE session_id = ?""",
-                (current_time_str, expires_time_str, ip, ua, existing_session_id)
-            )
-            conn.commit()
-            conn.close()
-            print(f"✅ Reused existing user session: {existing_session_id}")
-            return existing_session_id
-        
-        # 🚨 ONLY CREATE NEW SESSION if no valid sessions exist
-        new_sid = str(uuid.uuid4())
-        
-        cursor.execute(
-            """INSERT INTO user_sessions 
-               (session_id, user_id, ip, user_agent, created_at, last_accessed, expires_at, is_active) 
-               VALUES (?, ?, ?, ?, ?, ?, ?, 1)""",
-            (new_sid, user_id, ip, ua, current_time_str, current_time_str, expires_time_str)
-        )
-        conn.commit()
-        conn.close()
-        print(f"✅ Created new session: {new_sid}")
-        return new_sid
-        
-    except Exception as e:
-        print(f"❌ Session error: {e}")
-        # Fallback to in-memory
-        new_sid = str(uuid.uuid4())
-        user_sessions[new_sid] = {
-            'user_id': user_id,
-            'created_at': current_time,
-            'last_accessed': current_time
-        }
-        return new_sid
-
-def resolve_user_from_session(session_id: str) -> Optional[str]:
-    """FIXED: Resolve user from session with proper session management"""
-    if not session_id:
-        return None
-        
-    conn = get_db_conn()
-    if not conn:
-        session_data = user_sessions.get(session_id)
-        return session_data.get('user_id') if session_data else None
-        
-    try:
-        cursor = conn.cursor()
-        current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
-        
-        cursor.execute(
-            """SELECT user_id FROM user_sessions 
-               WHERE session_id = ? AND is_active = 1 AND expires_at > ?""",
-            (session_id, current_time)
-        )
-        row = cursor.fetchone()
-        
-        if row:
-            # ✅ Update session expiry when accessed
-            new_expires = (datetime.now() + timedelta(hours=24)).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
-            cursor.execute(
-                """UPDATE user_sessions 
-                   SET last_accessed = ?, expires_at = ?
-                   WHERE session_id = ?""",
-                (current_time, new_expires, session_id)
-            )
-            conn.commit()
-            return row[0]
-        return None
-        
-    except Exception as e:
-        print(f"❌ Session resolve error: {e}")
-        session_data = user_sessions.get(session_id)
-        return session_data.get('user_id') if session_data else None
-    finally:
-        if conn:
-            conn.close()
-        
-        # ---------------------------------------------------------
-# ✅ Database Functions - ADD MISSING FUNCTION
-# ---------------------------------------------------------
 
 def update_user_last_login(email: str) -> bool:
-    """Update user's last login timestamp with local time"""
+    """Update user's last login timestamp"""
     conn = get_db_conn()
     if not conn:
-        # Fallback to in-memory storage
         if email in users_db:
             users_db[email]['last_login_at'] = datetime.now().isoformat()
         return True
@@ -672,15 +656,215 @@ def update_user_last_login(email: str) -> bool:
         conn.close()
 
 # ---------------------------------------------------------
-# ✅ FILE STORAGE FUNCTIONS - NEW SECTION
+# ✅ SESSION MANAGEMENT FUNCTIONS
 # ---------------------------------------------------------
 
+def ensure_session(user_id: str, session_id: Optional[str], ip: Optional[str], ua: Optional[str], login_method: str = 'email') -> str:
+    """Create or update user session with conflict prevention"""
+    conn = get_db_conn()
+    
+    current_time = datetime.now()
+    expires_time = current_time + timedelta(hours=24)
+    
+    current_time_str = current_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+    expires_time_str = expires_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+    
+    if not conn:
+        # In-memory: Always create new session on login
+        new_sid = str(uuid.uuid4())
+        user_sessions[new_sid] = {
+            'user_id': user_id,
+            'created_at': current_time,
+            'last_accessed': current_time,
+            'login_method': login_method
+        }
+        print(f"✅ Created new in-memory session: {new_sid} for user: {user_id}")
+        return new_sid
+        
+    try:
+        cursor = conn.cursor()
+        
+        # 🚨 CRITICAL FIX: Deactivate ALL other active sessions for this user
+        cursor.execute("""
+            UPDATE user_sessions 
+            SET is_active = 0 
+            WHERE user_id = ? AND is_active = 1 AND session_id != ?
+        """, (user_id, session_id or ''))
+        
+        deactivated_count = cursor.rowcount
+        if deactivated_count > 0:
+            print(f"🔄 Deactivated {deactivated_count} previous sessions for user: {user_id}")
+        
+        # Check if provided session ID is valid and belongs to this user
+        if session_id:
+            cursor.execute(
+                """SELECT session_id, user_id FROM user_sessions 
+                   WHERE session_id = ? AND is_active = 1 AND expires_at > ?""",
+                (session_id, current_time_str)
+            )
+            existing_session = cursor.fetchone()
+            
+            if existing_session and existing_session[1] == user_id:
+                # Valid session for same user - update it
+                cursor.execute(
+                    """UPDATE user_sessions 
+                       SET last_accessed = ?, expires_at = ?, login_method = ?
+                       WHERE session_id = ?""",
+                    (current_time_str, expires_time_str, login_method, session_id)
+                )
+                conn.commit()
+                conn.close()
+                print(f"✅ Updated existing session: {session_id}")
+                return session_id
+        
+        # 🚨 CREATE NEW SESSION (always on fresh login)
+        new_sid = str(uuid.uuid4())
+        cursor.execute(
+            """INSERT INTO user_sessions 
+               (session_id, user_id, ip, user_agent, created_at, last_accessed, expires_at, is_active, login_method) 
+               VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)""",
+            (new_sid, user_id, ip, ua, current_time_str, current_time_str, expires_time_str, login_method)
+        )
+        conn.commit()
+        conn.close()
+        print(f"✅ Created new database session: {new_sid} for user: {user_id}")
+        return new_sid
+        
+    except Exception as e:
+        print(f"❌ Session error: {e}")
+        # Fallback to in-memory
+        new_sid = str(uuid.uuid4())
+        user_sessions[new_sid] = {
+            'user_id': user_id,
+            'created_at': current_time,
+            'last_accessed': current_time,
+            'login_method': login_method
+        }
+        return new_sid
 
-def store_file_in_db(upload_id: str, file_data: bytes, filename: str, user_id: str) -> bool:
-    """Store uploaded file in database with local time"""
+def resolve_user_from_session(session_id: str) -> Optional[str]:
+    """Resolve user from session with enhanced validation"""
+    if not session_id:
+        return None
+        
     conn = get_db_conn()
     if not conn:
-        # Fallback to in-memory storage
+        session_data = user_sessions.get(session_id)
+        return session_data.get('user_id') if session_data else None
+        
+    try:
+        cursor = conn.cursor()
+        current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+        
+        cursor.execute(
+            """SELECT user_id FROM user_sessions 
+               WHERE session_id = ? AND is_active = 1 AND expires_at > ?""",
+            (session_id, current_time)
+        )
+        row = cursor.fetchone()
+        
+        if row:
+            user_id = row[0]
+            # Update session expiry when accessed
+            new_expires = (datetime.now() + timedelta(hours=24)).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+            cursor.execute(
+                """UPDATE user_sessions 
+                   SET last_accessed = ?, expires_at = ?
+                   WHERE session_id = ?""",
+                (current_time, new_expires, session_id)
+            )
+            conn.commit()
+            print(f"✅ Session validated for user: {user_id}")
+            return user_id
+        
+        print(f"❌ Invalid or expired session: {session_id}")
+        return None
+        
+    except Exception as e:
+        print(f"❌ Session resolve error: {e}")
+        session_data = user_sessions.get(session_id)
+        return session_data.get('user_id') if session_data else None
+    finally:
+        if conn:
+            conn.close()
+            
+def resolve_user_from_session(session_id: str) -> Optional[str]:
+    """Resolve user from session with proper session management"""
+    if not session_id:
+        return None
+        
+    conn = get_db_conn()
+    if not conn:
+        session_data = user_sessions.get(session_id)
+        return session_data.get('user_id') if session_data else None
+        
+    try:
+        cursor = conn.cursor()
+        current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+        
+        cursor.execute(
+            """SELECT user_id FROM user_sessions 
+               WHERE session_id = ? AND is_active = 1 AND expires_at > ?""",
+            (session_id, current_time)
+        )
+        row = cursor.fetchone()
+        
+        if row:
+            # Update session expiry when accessed
+            new_expires = (datetime.now() + timedelta(hours=24)).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+            cursor.execute(
+                """UPDATE user_sessions 
+                   SET last_accessed = ?, expires_at = ?
+                   WHERE session_id = ?""",
+                (current_time, new_expires, session_id)
+            )
+            conn.commit()
+            return row[0]
+        return None
+        
+    except Exception as e:
+        print(f"❌ Session resolve error: {e}")
+        session_data = user_sessions.get(session_id)
+        return session_data.get('user_id') if session_data else None
+    finally:
+        if conn:
+            conn.close()
+
+def cleanup_expired_sessions() -> int:
+    """Clean up expired sessions"""
+    conn = get_db_conn()
+    current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+    
+    if not conn:
+        expired_count = 0
+        for session_id, session_data in list(user_sessions.items()):
+            if isinstance(session_data, dict):
+                if datetime.now() - session_data.get('created_at', datetime.now()) >= timedelta(hours=24):
+                    del user_sessions[session_id]
+                    expired_count += 1
+        return expired_count
+        
+    try:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM user_sessions WHERE expires_at <= ?", (current_time,))
+        expired_count = cursor.rowcount
+        conn.commit()
+        return expired_count
+    except Exception as e:
+        print(f"Session cleanup error: {e}")
+        return 0
+    finally:
+        if conn:
+            conn.close()
+
+# ---------------------------------------------------------
+# ✅ FILE STORAGE FUNCTIONS
+# ---------------------------------------------------------
+
+def store_file_in_db(upload_id: str, file_data: bytes, filename: str, user_id: str) -> bool:
+    """Store uploaded file in database"""
+    conn = get_db_conn()
+    if not conn:
         uploaded_files[upload_id] = {
             'data': file_data,
             'filename': filename,
@@ -692,18 +876,14 @@ def store_file_in_db(upload_id: str, file_data: bytes, filename: str, user_id: s
     try:
         cursor = conn.cursor()
         
-        # Determine file type
         file_type = "csv" if filename.lower().endswith(".csv") else "excel"
         file_size = len(file_data)
         
-        # Get current local time
         current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
         expires_time = (datetime.now() + timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
         
-        # FIXED: Proper duplicate handling with local time
         cursor.execute("SELECT 1 FROM uploaded_files WHERE upload_id = ?", (upload_id,))
         if cursor.fetchone():
-            # Update existing record with local time
             cursor.execute(
                 """UPDATE uploaded_files 
                    SET filename = ?, file_size = ?, file_data = ?, file_type = ?, uploaded_at = ?, expires_at = ?, is_active = 1
@@ -711,7 +891,6 @@ def store_file_in_db(upload_id: str, file_data: bytes, filename: str, user_id: s
                 (filename, file_size, file_data, file_type, current_time, expires_time, upload_id, user_id)
             )
         else:
-            # Insert new record with local time
             cursor.execute(
                 """INSERT INTO uploaded_files 
                    (upload_id, user_id, filename, file_size, file_data, file_type, uploaded_at, expires_at) 
@@ -723,7 +902,6 @@ def store_file_in_db(upload_id: str, file_data: bytes, filename: str, user_id: s
         return True
     except Exception as e:
         print(f"File storage error: {e}")
-        # Fallback to in-memory storage
         uploaded_files[upload_id] = {
             'data': file_data,
             'filename': filename,
@@ -735,10 +913,9 @@ def store_file_in_db(upload_id: str, file_data: bytes, filename: str, user_id: s
         conn.close()
 
 def get_file_from_db(upload_id: str, user_id: str) -> Optional[Dict[str, Any]]:
-    """Retrieve uploaded file from database with local time comparison"""
+    """Retrieve uploaded file from database"""
     conn = get_db_conn()
     if not conn:
-        # Fallback to in-memory storage
         file_info = uploaded_files.get(upload_id)
         if file_info and file_info['user_id'] == user_id:
             return file_info
@@ -746,7 +923,6 @@ def get_file_from_db(upload_id: str, user_id: str) -> Optional[Dict[str, Any]]:
         
     try:
         cursor = conn.cursor()
-        # Use local time for comparison
         current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
         cursor.execute(
             """SELECT upload_id, user_id, filename, file_size, file_data, file_type, uploaded_at 
@@ -761,14 +937,13 @@ def get_file_from_db(upload_id: str, user_id: str) -> Optional[Dict[str, Any]]:
                 'user_id': row[1],
                 'filename': row[2],
                 'file_size': row[3],
-                'data': row[4],  # This is the actual file data
+                'data': row[4],
                 'file_type': row[5],
                 'uploaded_at': row[6]
             }
         return None
     except Exception as e:
         print(f"File retrieval error: {e}")
-        # Fallback to in-memory storage
         file_info = uploaded_files.get(upload_id)
         if file_info and file_info['user_id'] == user_id:
             return file_info
@@ -777,16 +952,14 @@ def get_file_from_db(upload_id: str, user_id: str) -> Optional[Dict[str, Any]]:
         conn.close()
 
 def cleanup_expired_files() -> int:
-    """Clean up expired files using local time"""
+    """Clean up expired files"""
     conn = get_db_conn()
     current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
     
     if not conn:
-        # Clean in-memory storage
         current_datetime = datetime.now()
         expired_count = 0
         for upload_id, file_info in list(uploaded_files.items()):
-            # Files expire after 7 days in memory
             if file_info['uploaded_at'] + timedelta(days=7) < current_datetime:
                 del uploaded_files[upload_id]
                 expired_count += 1
@@ -803,7 +976,8 @@ def cleanup_expired_files() -> int:
         return 0
     finally:
         conn.close()
-# ---------------------------------------------------------
+        
+        # ---------------------------------------------------------
 # ✅ Authentication & Session Management
 # ---------------------------------------------------------
 def client_meta(x_forwarded_for: Optional[str], user_agent: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
@@ -812,15 +986,19 @@ def client_meta(x_forwarded_for: Optional[str], user_agent: Optional[str]) -> Tu
     return ip, ua
 
 def get_current_auth(request: Request):
-    """Get current authenticated user"""
-    sid = request.cookies.get("dp_session_id") or request.cookies.get("session_id")
+    """Get current authenticated user with better error handling"""
+    sid = request.cookies.get("dp_session_id")
+    
     if not sid:
+        print("❌ No session ID in cookies")
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
 
     user_email = resolve_user_from_session(sid)
     if not user_email:
+        print(f"❌ Invalid session: {sid}")
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid session")
 
+    # Get client info for session refresh
     xff = request.headers.get("X-Forwarded-For")
     ip = (xff.split(",")[0].strip() if xff else None)
     ua = request.headers.get("User-Agent")
@@ -828,8 +1006,598 @@ def get_current_auth(request: Request):
 
     # Refresh session
     new_sid = ensure_session(user_email, sid, ip, ua)
+    
+    print(f"✅ Authenticated user: {user_email}, session: {new_sid}")
     return {"user_id": user_email, "session_id": new_sid}
+# ---------------------------------------------------------
+# ✅ Pydantic Models
+# ---------------------------------------------------------
+class SignupRequest(BaseModel):
+    full_name: str
+    email: str
+    password: str
 
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+    remember: bool = False
+
+class AISummaryRequest(BaseModel):
+    upload_id: str
+    business_goal: Optional[str] = None
+    audience: Optional[str] = "executive"
+
+# ---------------------------------------------------------
+# ✅ Routes - COMPLETE SESSION MANAGEMENT
+# ---------------------------------------------------------
+
+@app.post("/api/auth/signup")
+async def signup(request: SignupRequest, response: Response):
+    """User signup - REDIRECTS TO LOGIN"""
+    # Check if user exists
+    existing_user = user_by_email(request.email)
+    if existing_user:
+        raise HTTPException(status_code=409, detail="EMAIL_TAKEN")
+
+    # Hash password
+    pw_hash = bcrypt.hashpw(request.password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    
+    # Create user
+    if not insert_user(request.full_name, request.email, pw_hash):
+        raise HTTPException(status_code=400, detail="Signup failed")
+
+    # ✅ REDIRECT TO LOGIN instead of auto-login
+    return {
+        "success": True, 
+        "message": "Signup successful - Please login",
+        "redirect_to_login": True
+    }
+
+@app.post("/api/auth/login")
+async def login(request: LoginRequest, fastapi_request: Request, response: Response): 
+    """User login with proper session management"""
+    user = user_by_email(request.email)
+    if not user or not user.get("password_hash"):
+        raise HTTPException(status_code=401, detail="INVALID_CREDENTIALS")
+
+    # Verify password
+    if not bcrypt.checkpw(request.password.encode("utf-8"), user["password_hash"].encode("utf-8")):
+        raise HTTPException(status_code=401, detail="INVALID_CREDENTIALS")
+
+    # Update last login
+    update_user_last_login(request.email)
+
+    # 🚨 FIX: Use fastapi_request instead of request for headers
+    xff = fastapi_request.headers.get("X-Forwarded-For")  
+    ip = (xff.split(",")[0].strip() if xff else None)
+    ua = fastapi_request.headers.get("User-Agent")  
+    ua = ua[:512] if ua else None
+
+    # Create new session
+    session_id = ensure_session(user["email"], None, ip, ua, "email")
+
+    # Set cookie
+    response.set_cookie(
+        key="dp_session_id",
+        value=session_id,
+        httponly=True,
+        secure=True,
+        samesite="none",
+        max_age=(60 * 60 * 24 * 30) if request.remember else 86400,
+        path="/"
+    )
+    
+    print(f"✅ User {user['email']} logged in with new session: {session_id}")
+    
+    return {
+        "success": True, 
+        "message": "Login successful", 
+        "session_id": session_id,
+        "user_id": user["email"],
+        "user_name": user.get("full_name", "User")
+    }
+    
+@app.post("/api/analyze")
+async def analyze(
+    request: Request,
+    response: Response,
+    file: UploadFile = File(...),
+    auth: dict = Depends(get_current_auth),
+):
+    """Comprehensive data analysis - WITH DAILY LIMIT ENFORCEMENT"""
+    user_id = auth["user_id"]
+    session_id = auth["session_id"]
+
+    # ✅ CHECK REPORT ELIGIBILITY
+    eligibility = check_report_eligibility(user_id)
+    if not eligibility["can_generate"]:
+        return JSONResponse(
+            status_code=402,
+            content={
+                "error": "DAILY_LIMIT_REACHED",
+                "message": "You've reached your daily report limit",
+                "next_available": eligibility["next_available"].isoformat() if eligibility["next_available"] else None,
+                "upgrade_url": "/pricing",
+                "reason": eligibility["reason"]
+            }
+        )
+
+    # Refresh session cookie
+    response.set_cookie(
+        key="dp_session_id",
+        value=session_id,
+        httponly=True,
+        secure=True,
+        samesite="none",
+        path="/"
+    )
+    response.headers["X-Session-Id"] = session_id
+
+    # Check file size
+    raw = await file.read()
+    if len(raw) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File too large (max 10MB)")
+
+    # Generate upload ID
+    timestamp = int(datetime.now().timestamp())
+    random_component = str(uuid.uuid4())[:8]
+    file_hash = hashlib.sha256(raw).hexdigest()[:16]
+    upload_id = f"{timestamp}_{random_component}_{file_hash}"
+    
+    # Store file in database
+    store_success = store_file_in_db(upload_id, raw, file.filename, user_id)
+    if not store_success:
+        raise HTTPException(status_code=500, detail="Failed to store file")
+
+    # ✅ INCREMENT REPORT COUNT
+    increment_report_count(user_id)
+
+    # Parse file
+    try:
+        if (file.filename or "").lower().endswith(".csv"):
+            df = pd.read_csv(BytesIO(raw))
+        else:
+            df = pd.read_excel(BytesIO(raw))
+    except Exception as e:
+        return JSONResponse(
+            status_code=400, 
+            content={"error": "INVALID_FILE", "detail": str(e)}
+        )
+
+    # Basic profiling
+    try_parse_dates_inplace(df)
+    
+    numeric_cols = df.select_dtypes("number").columns.tolist()
+    profiling = {
+        "rows": int(df.shape[0]),
+        "columns": int(df.shape[1]),
+        "missing_total": int(df.isnull().sum().sum()),
+        "dtypes": {c: str(t) for c, t in df.dtypes.items()},
+        "numeric_columns": numeric_cols,
+    }
+
+    # Calculate KPIs
+    numeric_df = df.select_dtypes(include="number").apply(pd.to_numeric, errors="coerce")
+    total_cells = max(1, int(df.shape[0] * df.shape[1]))
+    missing_total = int(df.isna().sum().sum())
+    missing_pct = round(missing_total / total_cells * 100, 2)
+    duplicates = int(df.duplicated().sum())
+
+    outlier_counts = {c: _iqr_outliers(numeric_df[c]) for c in numeric_df.columns} if not numeric_df.empty else {}
+    total_outliers = int(sum(outlier_counts.values()))
+    rows_per_day = None
+    date_cols = df.select_dtypes(include=['datetime64']).columns.tolist()
+    if date_cols:
+      try:
+        date_col = date_cols[0]
+        unique_days = df[date_col].dt.normalize().nunique()
+        if unique_days > 0:
+            rows_per_day = round(len(df) / unique_days, 1)
+      except Exception as e:
+        print(f"Rows per day calculation error: {e}")
+        
+    kpis = {
+        "total_rows": int(df.shape[0]),
+        "total_columns": int(df.shape[1]),
+        "missing_pct": _safe_float(missing_pct),
+        "duplicate_rows": duplicates,
+        "outliers_total": total_outliers,
+        "rows_per_day": rows_per_day
+    }
+
+    # Generate AI insights and visualizations
+    ai_service = AIService()
+    detailed_summary = ai_service.generate_detailed_summary(df, None, "executive")
+    visualizations = ai_service.recommend_visualizations(df, None)
+
+    return {
+        "profiling": profiling,
+        "kpis": kpis,
+        "charts": visualizations.get("charts", {}),
+        "visualizations_metadata": {
+            "primary_insights": visualizations.get("primary_insights", []),
+            "data_story": visualizations.get("data_story", ""),
+            "recommendations": visualizations.get("recommendations", [])
+        },
+        "insights": {
+            "summary": "AI-powered analysis complete",
+            "key_insights": visualizations.get("primary_insights", []),
+            "recommendations": ["Review AI-generated visualizations for insights"]
+        },
+        "detailed_summary": detailed_summary,
+        "session_id": session_id,
+        "upload_id": upload_id,
+        "file": {
+            "name": file.filename,
+            "size_bytes": len(raw),
+        },
+        "usage_info": {
+            "report_used": True,
+            "remaining_today": 0,
+            "next_report_available": (datetime.now() + timedelta(hours=24)).isoformat()
+        }
+    }
+
+@app.post("/api/ai-summary")
+async def ai_summary(
+    request: AISummaryRequest,
+    response: Response,
+    auth: dict = Depends(get_current_auth),
+):
+    """Generate AI summary - WITH USAGE CHECK"""
+    user_id = auth["user_id"]
+    session_id = auth["session_id"]
+
+    # ✅ CHECK REPORT ELIGIBILITY for premium features
+    eligibility = check_report_eligibility(user_id)
+    if not eligibility["can_generate"] and not eligibility["is_premium"]:
+        return JSONResponse(
+            status_code=402,
+            content={
+                "error": "DAILY_LIMIT_REACHED",
+                "message": "You've reached your daily report limit",
+                "next_available": eligibility["next_available"].isoformat() if eligibility["next_available"] else None,
+                "upgrade_url": "/pricing"
+            }
+        )
+
+    # Refresh session cookie
+    response.set_cookie(
+        key="dp_session_id",
+        value=session_id,
+        httponly=True,
+        secure=True,
+        samesite="none",
+        path="/"
+    )
+    response.headers["X-Session-Id"] = session_id
+
+    # Retrieve uploaded file
+    file_info = get_file_from_db(request.upload_id, user_id)
+    if not file_info:
+        raise HTTPException(status_code=404, detail="File not found or access denied")
+
+    try:
+        # Parse the file
+        file_data = file_info['data']
+        filename = file_info['filename']
+        
+        if filename.lower().endswith(".csv"):
+            df = pd.read_csv(BytesIO(file_data))
+        else:
+            df = pd.read_excel(BytesIO(file_data))
+
+        # Generate comprehensive AI analysis
+        ai_service = AIService()
+        detailed_summary = ai_service.generate_detailed_summary(
+            df, 
+            request.business_goal, 
+            request.audience
+        )
+        
+        return {
+            **detailed_summary,
+            "session_id": session_id,
+            "upload_id": request.upload_id
+        }
+        
+    except Exception as e:
+        return JSONResponse(
+            status_code=400, 
+            content={"error": "ANALYSIS_FAILED", "detail": str(e)}
+        )
+
+# ---------------------------------------------------------
+# ✅ GOOGLE OAUTH ROUTES - COMPLETE FIXED VERSION
+# ---------------------------------------------------------
+@app.get("/api/auth/google")
+async def google_login():
+    """Start Google OAuth flow"""
+    client_id = "144224946029-99vhg2ds2dhfn4i98qmkj5v88fgbtnt7.apps.googleusercontent.com"
+    redirect_uri = "https://test-six-fawn-47.vercel.app/api/auth/google/callback"
+    
+    auth_url = (
+        f"https://accounts.google.com/o/oauth2/v2/auth?"
+        f"client_id={client_id}&"
+        f"response_type=code&"
+        f"scope=openid%20email%20profile&"
+        f"redirect_uri={redirect_uri}&"
+        f"access_type=offline&"
+        f"prompt=select_account"
+    )
+    
+    return RedirectResponse(auth_url)
+
+@app.get("/api/auth/google/callback")
+async def google_callback(request: Request, response: Response, code: str = None):
+    """Handle Google OAuth callback with session recording"""
+    try:
+        if not code:
+            return RedirectResponse(f"{FRONTEND_URL}/login?error=no_code")
+        
+        # Exchange code for tokens
+        token_url = "https://oauth2.googleapis.com/token"
+        data = {
+            'client_id': "144224946029-99vhg2ds2dhfn4i98qmkj5v88fgbtnt7.apps.googleusercontent.com",
+            'client_secret': "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",
+            'code': code,
+            'grant_type': 'authorization_code',
+            'redirect_uri': 'https://test-six-fawn-47.vercel.app/api/auth/google/callback'
+        }
+        
+        async with httpx.AsyncClient() as client:
+            token_response = await client.post(token_url, data=data)
+            tokens = token_response.json()
+            
+            if 'error' in tokens:
+                print(f"Token error: {tokens}")
+                return RedirectResponse(f"{FRONTEND_URL}/login?error=auth_failed")
+            
+            # Get user info from Google
+            userinfo_response = await client.get(
+                'https://www.googleapis.com/oauth2/v3/userinfo',
+                headers={'Authorization': f"Bearer {tokens['access_token']}"}
+            )
+            user_info = userinfo_response.json()
+            
+            if 'error' in user_info:
+                print(f"Userinfo error: {user_info}")
+                return RedirectResponse(f"{FRONTEND_URL}/login?error=user_info_failed")
+        
+        # Extract user data
+        email = user_info['email']
+        name = user_info.get('name', 'User')
+        google_id = user_info['sub']
+        
+        print(f"Google user: {email}, {name}, {google_id}")
+        
+        # Check if user exists by Google ID first
+        existing_user = user_by_google_id(google_id)
+        
+        if not existing_user:
+            # Check if user exists by email (merge accounts)
+            existing_user = user_by_email(email)
+            if existing_user:
+                # Update existing user with Google ID
+                update_user_google_id(email, google_id)
+            else:
+                # Create new Google user
+                if not create_google_user(email, name, google_id):
+                    return RedirectResponse(f"{FRONTEND_URL}/login?error=user_creation_failed")
+                existing_user = user_by_google_id(google_id)
+        
+        user_id = existing_user['email']
+        
+        # Update last login
+        update_user_last_login(user_id)
+        
+        # Get IP and User Agent
+        xff = request.headers.get("X-Forwarded-For")
+        client_ip = xff.split(",")[0].strip() if xff else request.client.host
+        user_agent = request.headers.get("User-Agent", "")[:512]
+        
+        # ✅ CREATE SESSION WITH GOOGLE LOGIN METHOD
+        session_id = ensure_session(user_id, None, client_ip, user_agent, "google")
+        
+        # Set cookies
+        response.set_cookie(
+            key="dp_session_id",
+            value=session_id,
+            httponly=True,
+            secure=True,
+            samesite="none",
+            max_age=30 * 24 * 60 * 60,  # 30 days
+            path="/",
+        )
+        
+        print(f"✅ Google OAuth successful for {email}, session: {session_id}")
+        
+        # Redirect to analyze page
+        return RedirectResponse(f"{FRONTEND_URL}/analyze")
+        
+    except Exception as e:
+        print(f"Google OAuth error: {e}")
+        return RedirectResponse(f"{FRONTEND_URL}/login?error=auth_failed")
+
+# ---------------------------------------------------------
+# ✅ USAGE & SESSION MANAGEMENT ROUTES
+# ---------------------------------------------------------
+
+@app.get("/api/usage/stats")
+async def get_usage_stats_endpoint(auth: dict = Depends(get_current_auth)):
+    """Get current user's usage statistics"""
+    try:
+        user_id = auth["user_id"]
+        stats = get_user_report_stats(user_id)
+        
+        return {
+            "can_generate": stats["can_generate"],
+            "today_used": stats["today_used"],
+            "daily_limit": stats["daily_limit"],
+            "is_premium": stats["is_premium"],
+            "next_available": stats["next_available"].isoformat() if stats["next_available"] else None,
+            "reason": stats["reason"]
+        }
+        
+    except Exception as e:
+        print(f"Error in usage stats endpoint: {e}")
+        return {
+            "can_generate": True,
+            "today_used": 0,
+            "daily_limit": 1,
+            "is_premium": False,
+            "next_available": None,
+            "reason": "ERROR"
+        }
+
+@app.get("/api/auth/me")
+async def get_current_user(auth: dict = Depends(get_current_auth)):
+    """Get current user info"""
+    user_data = user_by_email(auth["user_id"])
+    return {
+        "success": True,
+        "user_id": auth["user_id"],
+        "session_id": auth["session_id"],
+        "authenticated": True,
+        "user_name": user_data.get("full_name") if user_data else "User",
+        "email": auth["user_id"],
+        "is_premium": user_data.get("is_premium", False) if user_data else False
+    }
+
+@app.post("/api/auth/logout")
+async def logout(request: Request, response: Response):
+    """Enhanced logout with proper session cleanup"""
+    sid = request.cookies.get("dp_session_id")
+    
+    print(f"🚪 Logout requested for session: {sid}")
+    
+    if sid:
+        # Invalidate session in database
+        conn = get_db_conn()
+        if conn:
+            try:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM user_sessions WHERE session_id = ?", (sid,))
+                conn.commit()
+                conn.close()
+                print(f"✅ Session {sid} deleted from database")
+            except Exception as e:
+                print(f"Session deletion error: {e}")
+        
+        # Remove from in-memory storage
+        if sid in user_sessions:
+            del user_sessions[sid]
+            print(f"✅ Session {sid} deleted from memory")
+    
+    # Clear cookie with proper settings
+    response.delete_cookie(
+        key="dp_session_id",
+        path="/",
+        secure=True,
+        httponly=True,
+        samesite="none"
+    )
+    print("✅ Cookie cleared, logout complete")
+    return {"success": True, "message": "Logout successful"}
+
+# ---------------------------------------------------------
+# ✅ PAYMENT REDIRECTION ENDPOINT
+# ---------------------------------------------------------
+
+@app.get("/api/payment/redirect")
+async def payment_redirect(auth: dict = Depends(get_current_auth)):
+    """Redirect user to payment page with user context"""
+    return {
+        "success": True,
+        "payment_url": f"/pricing?user_id={auth['user_id']}",
+        "user_id": auth['user_id']
+    }
+
+# ---------------------------------------------------------
+# ✅ DEBUG ROUTES
+# ---------------------------------------------------------
+@app.get("/api/debug/sessions")
+async def debug_sessions():
+    """Debug endpoint to see all active sessions"""
+    conn = get_db_conn()
+    if not conn:
+        return {"storage": "in_memory", "sessions": user_sessions}
+    
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT session_id, user_id, created_at, last_accessed, expires_at, login_method 
+            FROM user_sessions 
+            WHERE is_active = 1 AND expires_at > GETDATE()
+        """)
+        rows = cursor.fetchall()
+        sessions = []
+        for row in rows:
+            sessions.append({
+                'session_id': row[0],
+                'user_id': row[1],
+                'created_at': row[2].isoformat() if row[2] else None,
+                'last_accessed': row[3].isoformat() if row[3] else None,
+                'expires_at': row[4].isoformat() if row[4] else None,
+                'login_method': row[5]
+            })
+        return {"storage": "database", "sessions": sessions}
+    except Exception as e:
+        return {"error": str(e), "storage": "in_memory", "sessions": user_sessions}
+    finally:
+        conn.close()
+
+@app.get("/api/debug/reports")
+async def debug_reports():
+    """Debug endpoint to see report usage"""
+    conn = get_db_conn()
+    if not conn:
+        return {"storage": "in_memory", "reports": user_reports}
+    
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT user_id, report_date, report_count, last_report_at 
+            FROM user_reports 
+            WHERE report_date >= CAST(GETDATE() AS DATE)
+        """)
+        rows = cursor.fetchall()
+        reports = []
+        for row in rows:
+            reports.append({
+                'user_id': row[0],
+                'report_date': row[1].isoformat() if row[1] else None,
+                'report_count': row[2],
+                'last_report_at': row[3].isoformat() if row[3] else None
+            })
+        return {"storage": "database", "reports": reports}
+    except Exception as e:
+        return {"error": str(e), "storage": "in_memory", "reports": user_reports}
+    finally:
+        conn.close()
+
+# ---------------------------------------------------------
+# ✅ STARTUP EVENT
+# ---------------------------------------------------------
+@app.on_event("startup")
+async def startup_event():
+    """Initialize application on startup"""
+    print("🚀 DataPulse API starting up...")
+    ensure_tables()
+    print("✅ Database tables initialized")
+    
+    # Clean up expired files and sessions
+    cleaned_files = cleanup_expired_files()
+    cleaned_sessions = cleanup_expired_sessions()
+    
+    if cleaned_files > 0:
+        print(f"🧹 Cleaned up {cleaned_files} expired files")
+    if cleaned_sessions > 0:
+        print(f"🧹 Cleaned up {cleaned_sessions} expired sessions")
+    
+    # Test AI service
+    ai_service = AIService()
+    print("✅ Services initialized")
 # ---------------------------------------------------------
 # ✅ Enhanced AI Service (UNCHANGED)
 # ---------------------------------------------------------
@@ -1502,7 +2270,6 @@ class AIService:
             "data_story": "The dataset shows various patterns across different dimensions",
             "recommendations": []
         }
-
 # ---------------------------------------------------------
 # ✅ Data Analysis Functions
 # ---------------------------------------------------------
@@ -1574,715 +2341,6 @@ def _iqr_outliers(col: pd.Series) -> int:
     except Exception as e:
         print(f"Outlier calculation error for column: {e}")
         return 0
-
-# ---------------------------------------------------------
-# ✅ Routes - UPDATED FOR DATABASE FILE STORAGE
-# ---------------------------------------------------------
-@app.get("/api/debug/users")
-async def debug_users():
-    """Debug endpoint to see all users in database"""
-    conn = get_db_conn()
-    if not conn:
-        return {"storage": "in_memory", "users": users_db}
-    
-    try:
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, email, full_name, created_at FROM users")
-        rows = cursor.fetchall()
-        users = []
-        for row in rows:
-            users.append({
-                'id': row[0],
-                'email': row[1],
-                'full_name': row[2],
-                'created_at': row[3].isoformat() if row[3] else None
-            })
-        return {"storage": "database", "users": users}
-    except Exception as e:
-        return {"error": str(e), "storage": "in_memory", "users": users_db}
-    finally:
-        conn.close()
-        
-@app.get("/api/debug/db-status")
-async def debug_db_status():
-    """Check database connection status"""
-    try:
-        conn = get_db_conn()
-        if conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT @@version as version")
-            version = cursor.fetchone()
-            cursor.execute("SELECT COUNT(*) as user_count FROM users")
-            count = cursor.fetchone()
-            cursor.execute("SELECT COUNT(*) as file_count FROM uploaded_files")
-            file_count = cursor.fetchone()
-            conn.close()
-            return {
-                "status": "connected",
-                "database": "SQL Server",
-                "version": version[0] if version else "unknown",
-                "user_count": count[0] if count else 0,
-                "file_count": file_count[0] if file_count else 0
-            }
-        else:
-            return {"status": "disconnected", "storage": "in_memory", "user_count": len(users_db), "file_count": len(uploaded_files)}
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
-    
-@app.get("/")
-async def root():
-    return {"status": "success", "message": "DataPulse API running on Vercel", "version": "1.0.0"}
-
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
-
-@app.get("/health/db")
-async def health_db():
-    """Check database connectivity"""
-    try:
-        ensure_tables()
-        return {"ok": True, "database": "connected"}
-    except Exception as e:
-        return {"ok": False, "database": "error", "error": str(e)}
-
-@app.post("/api/auth/signup")
-async def signup(request: SignupRequest, response: Response):
-    """User signup with auto-login"""
-    # Check if user exists
-    existing_user = user_by_email(request.email)
-    if existing_user:
-        raise HTTPException(status_code=409, detail="EMAIL_TAKEN")
-
-    # Hash password
-    pw_hash = bcrypt.hashpw(request.password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
-    
-    # Create user
-    if not insert_user(request.full_name, request.email, pw_hash):
-        raise HTTPException(status_code=400, detail="Signup failed")
-
-    # Auto-login
-    ip, ua = client_meta(None, None)  # Simplified for now
-    session_id = ensure_session(request.email, None, ip, ua)
-
-    # Set cookie - FIXED for production
-    response.set_cookie(
-        key="dp_session_id",
-        value=session_id,
-        httponly=True,
-        secure=True,           # Required for HTTPS
-        samesite="none",       # Required for cross-origin
-        max_age=86400,         # 24 hours
-        path="/"
-    )
-    response.headers["X-Session-Id"] = session_id
-    
-    return {
-        "success": True, 
-        "message": "Signup successful", 
-        "session_id": session_id,
-        "user_id": request.email
-    }
-
-@app.post("/api/auth/login")
-async def login(request: LoginRequest, response: Response):
-    """User login"""
-    user = user_by_email(request.email)
-    if not user or not user.get("password_hash"):
-        raise HTTPException(status_code=401, detail="INVALID_CREDENTIALS")
-
-    # Verify password
-    if not bcrypt.checkpw(request.password.encode("utf-8"), user["password_hash"].encode("utf-8")):
-        raise HTTPException(status_code=401, detail="INVALID_CREDENTIALS")
-
-    # Create session
-    ip, ua = client_meta(None, None)
-    session_id = ensure_session(user["email"], None, ip, ua)
-
-    # Set cookie - FIXED for production
-    response.set_cookie(
-        key="dp_session_id",
-        value=session_id,
-        httponly=True,
-        secure=True,
-        samesite="none",
-        max_age=(60 * 60 * 24 * 30) if request.remember else 86400,
-        path="/"
-    )
-    response.headers["X-Session-Id"] = session_id
-    
-    return {
-        "success": True, 
-        "message": "Login successful", 
-        "session_id": session_id,
-        "user_id": user["email"]
-    }
-
-@app.post("/api/ai-summary")
-async def ai_summary(
-    request: AISummaryRequest,
-    response: Response,
-    auth: dict = Depends(get_current_auth),
-):
-    """Generate comprehensive AI summary for previously uploaded file"""
-    user_id = auth["user_id"]
-    session_id = auth["session_id"]
-
-    # Refresh session cookie
-    response.set_cookie(
-        key="dp_session_id",
-        value=session_id,
-        httponly=True,
-        secure=True,
-        samesite="none",
-        path="/"
-    )
-    response.headers["X-Session-Id"] = session_id
-
-    # Retrieve uploaded file FROM DATABASE
-    file_info = get_file_from_db(request.upload_id, user_id)
-    if not file_info:
-        raise HTTPException(status_code=404, detail="File not found or access denied")
-
-    try:
-        # Parse the file
-        file_data = file_info['data']  # This now comes from database
-        filename = file_info['filename']
-        
-        if filename.lower().endswith(".csv"):
-            df = pd.read_csv(BytesIO(file_data))
-        else:
-            df = pd.read_excel(BytesIO(file_data))
-
-        # Generate comprehensive AI analysis
-        ai_service = AIService()
-        detailed_summary = ai_service.generate_detailed_summary(
-            df, 
-            request.business_goal, 
-            request.audience
-        )
-        
-        return {
-            **detailed_summary,
-            "session_id": session_id,
-            "upload_id": request.upload_id
-        }
-        
-    except Exception as e:
-        return JSONResponse(
-            status_code=400, 
-            content={"error": "ANALYSIS_FAILED", "detail": str(e)}
-        )
-
-@app.post("/api/analyze")
-async def analyze(
-    request: Request,
-    response: Response,
-    file: UploadFile = File(...),
-    auth: dict = Depends(get_current_auth),
-):
-    """Comprehensive data analysis - UPDATED FOR DATABASE FILE STORAGE"""
-    user_id = auth["user_id"]
-    session_id = auth["session_id"]
-
-    # Refresh session cookie
-    response.set_cookie(
-        key="dp_session_id",
-        value=session_id,
-        httponly=True,
-        secure=True,
-        samesite="none",
-        path="/"
-    )
-    response.headers["X-Session-Id"] = session_id
-
-  # ✅ CHECK USAGE LIMITS
-    if not check_usage_limit(user_id):
-        return JSONResponse(
-            status_code=402,
-            content={
-                "error": "USAGE_LIMIT_EXCEEDED",
-                "message": "You've reached your daily report limit",
-                "upgrade_url": "/pricing"
-            }
-        )
-    # Check file size
-    raw = await file.read()
-    if len(raw) > 10 * 1024 * 1024:  # 10MB limit
-        raise HTTPException(status_code=400, detail="File too large (max 10MB)")
-
-    
-    # Generate UNIQUE upload ID with timestamp and random component
-    timestamp = int(datetime.now().timestamp())
-    random_component = str(uuid.uuid4())[:8]
-    file_hash = hashlib.sha256(raw).hexdigest()[:16]
-    upload_id = f"{timestamp}_{random_component}_{file_hash}"
-    
-     # STORE FILE IN DATABASE with enhanced logging
-    print(f"📁 Storing file: {file.filename}, size: {len(raw)} bytes, upload_id: {upload_id}")
-    store_success = store_file_in_db(upload_id, raw, file.filename, user_id)
-    
-    if not store_success:
-        raise HTTPException(status_code=500, detail="Failed to store file")
-
-    # ✅ INCREMENT USAGE COUNT
-    increment_usage_count(user_id)
-
-
-    # Parse file
-    try:
-        if (file.filename or "").lower().endswith(".csv"):
-            df = pd.read_csv(BytesIO(raw))
-        else:
-            df = pd.read_excel(BytesIO(raw))
-    except Exception as e:
-        return JSONResponse(
-            status_code=400, 
-            content={"error": "INVALID_FILE", "detail": str(e)}
-        )
-
-
-    # Basic profiling
-    try_parse_dates_inplace(df)
-    
-    numeric_cols = df.select_dtypes("number").columns.tolist()
-    profiling = {
-        "rows": int(df.shape[0]),
-        "columns": int(df.shape[1]),
-        "missing_total": int(df.isnull().sum().sum()),
-        "dtypes": {c: str(t) for c, t in df.dtypes.items()},
-        "numeric_columns": numeric_cols,
-    }
-
-    # Calculate KPIs
-    numeric_df = df.select_dtypes(include="number").apply(pd.to_numeric, errors="coerce")
-    total_cells = max(1, int(df.shape[0] * df.shape[1]))
-    missing_total = int(df.isna().sum().sum())
-    missing_pct = round(missing_total / total_cells * 100, 2)
-    duplicates = int(df.duplicated().sum())
-
-    outlier_counts = {c: _iqr_outliers(numeric_df[c]) for c in numeric_df.columns} if not numeric_df.empty else {}
-    total_outliers = int(sum(outlier_counts.values()))
-    rows_per_day = None
-    date_cols = df.select_dtypes(include=['datetime64']).columns.tolist()
-    if date_cols:
-      try:
-        # Use first date column
-        date_col = date_cols[0]
-        # Count unique days and calculate average rows per day
-        unique_days = df[date_col].dt.normalize().nunique()
-        if unique_days > 0:
-            rows_per_day = round(len(df) / unique_days, 1)
-      except Exception as e:
-        print(f"Rows per day calculation error: {e}")
-        
-    kpis = {
-        "total_rows": int(df.shape[0]),
-        "total_columns": int(df.shape[1]),
-        "missing_pct": _safe_float(missing_pct),
-        "duplicate_rows": duplicates,
-        "outliers_total": total_outliers,
-        "rows_per_day": rows_per_day # ✅ ADD THIS LINE
-
-    }
-
-    # Generate AI insights and visualizations
-    ai_service = AIService()
-    detailed_summary = ai_service.generate_detailed_summary(df, None, "executive")
-    visualizations = ai_service.recommend_visualizations(df, None)
-
-    return {
-        "profiling": profiling,
-        "kpis": kpis,
-        "charts": visualizations.get("charts", {}),  # ✅ ADD THIS LINE
-        "visualizations_metadata": {  # ✅ ADD THIS SECTION
-            "primary_insights": visualizations.get("primary_insights", []),
-            "data_story": visualizations.get("data_story", ""),
-            "recommendations": visualizations.get("recommendations", [])
-        },
-        "insights": {
-            "summary": "AI-powered analysis complete",
-            "key_insights": visualizations.get("primary_insights", []),
-            "recommendations": ["Review AI-generated visualizations for insights"]
-        },
-        "detailed_summary": detailed_summary,
-        "session_id": session_id,
-        "upload_id": upload_id,
-        "file": {
-            "name": file.filename,
-            "size_bytes": len(raw),
-        },
-    }
-
-@app.post("/api/ai-visualizations")
-async def ai_visualizations(
-    request: AISummaryRequest,  # Reuse the same request model
-    response: Response,
-    auth: dict = Depends(get_current_auth),
-):
-    
-    """Generate AI-powered visualizations for uploaded file"""
-    user_id = auth["user_id"]
-    session_id = auth["session_id"]
-
-    # Refresh session cookie
-    response.set_cookie(
-        key="dp_session_id",
-        value=session_id,
-        httponly=True,
-        secure=True,
-        samesite="none",
-        path="/"
-    )
-
-    # Retrieve uploaded file FROM DATABASE
-    file_info = get_file_from_db(request.upload_id, user_id)
-    if not file_info:
-        raise HTTPException(status_code=404, detail="File not found or access denied")
-
-    try:
-        # Parse the file
-        file_data = file_info['data']  # This now comes from database
-        filename = file_info['filename']
-        
-        if filename.lower().endswith(".csv"):
-            df = pd.read_csv(BytesIO(file_data))
-        else:
-            df = pd.read_excel(BytesIO(file_data))
-
-        # Generate AI-powered visualizations
-        ai_service = AIService()
-        visualizations = ai_service.recommend_visualizations(df, request.business_goal)
-        
-        return {
-            **visualizations,
-            "session_id": session_id,
-            "upload_id": request.upload_id
-        }
-        
-    except Exception as e:
-        return JSONResponse(
-            status_code=400, 
-            content={"error": "VISUALIZATION_FAILED", "detail": str(e)}
-        )
-        
-@app.post("/api/auth/logout")
-async def logout(request: Request, response: Response):
-    """ENHANCED: User logout with session invalidation"""
-    sid = request.cookies.get("dp_session_id")
-    if sid:
-        # Invalidate session in database
-        conn = get_db_conn()
-        if conn:
-            try:
-                cursor = conn.cursor()
-                cursor.execute("DELETE FROM user_sessions WHERE session_id = ?", (sid,))
-                conn.commit()
-                conn.close()
-            except Exception as e:
-                print(f"Session deletion error: {e}")
-        
-        # Remove from in-memory storage
-        if sid in user_sessions:
-            del user_sessions[sid]
-    
-    # Clear cookie
-    response.delete_cookie("dp_session_id", path="/")
-    return {"success": True, "message": "Logout successful"}
-
-@app.get("/api/test-db")
-async def test_db():
-    """Test if database is connected"""
-    try:
-        conn = get_db_conn()
-        if conn:
-            # Try to create tables
-            ensure_tables()
-            conn.close()
-            return {"database": "CONNECTED ✅", "storage": "SQL Server"}
-        else:
-            return {"database": "NOT CONNECTED ⚠️", "storage": "In-Memory"}
-    except Exception as e:
-        return {"database": "ERROR ❌", "error": str(e), "storage": "In-Memory"}
-
-@app.post("/api/debug-analysis")
-async def debug_analysis(
-    request: Request,
-    response: Response,
-    file: UploadFile = File(...),
-    auth: dict = Depends(get_current_auth),
-):
-    """Debug endpoint to see the complete analysis structure"""
-    user_id = auth["user_id"]
-    session_id = auth["session_id"]
-
-    # Check file size
-    raw = await file.read()
-    if len(raw) > 10 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="File too large")
-
-    # Parse file
-    try:
-        if (file.filename or "").lower().endswith(".csv"):
-            df = pd.read_csv(BytesIO(raw))
-        else:
-            df = pd.read_excel(BytesIO(raw))
-    except Exception as e:
-        return JSONResponse(status_code=400, content={"error": "INVALID_FILE", "detail": str(e)})
-
-    # Generate AI analysis
-    ai_service = AIService()
-    detailed_summary = ai_service.generate_detailed_summary(df, None, "executive")
-
-    # Return debug information
-    return {
-        "debug_info": {
-            "detailed_summary_keys": list(detailed_summary.keys()),
-            "has_executive_overview": "executive_overview" in detailed_summary,
-            "has_key_trends": "key_trends" in detailed_summary and len(detailed_summary["key_trends"]) > 0,
-            "has_quick_wins": "action_items_quick_wins" in detailed_summary and len(detailed_summary["action_items_quick_wins"]) > 0,
-            "has_business_implications": "business_implications" in detailed_summary,
-            "has_recommendations": "recommendations" in detailed_summary,
-            "has_risk_alerts": "risk_alerts" in detailed_summary,
-            "has_predictive_insights": "predictive_insights" in detailed_summary,
-            "has_industry_comparison": "industry_comparison" in detailed_summary,
-        },
-        "complete_detailed_summary": detailed_summary,
-        "sample_data_structure": {
-            "executive_overview_length": len(detailed_summary.get("executive_overview", "")),
-            "key_trends_count": len(detailed_summary.get("key_trends", [])),
-            "quick_wins_count": len(detailed_summary.get("action_items_quick_wins", [])),
-            "business_implications_count": len(detailed_summary.get("business_implications", [])),
-            "risk_alerts_count": len(detailed_summary.get("risk_alerts", [])),
-            "predictive_insights_count": len(detailed_summary.get("predictive_insights", [])),
-        }
-    }
-
-# ---------------------------------------------------------
-# ✅ GOOGLE OAUTH ROUTES - COMPLETE FIXED VERSION
-# ---------------------------------------------------------
-@app.get("/api/auth/google")
-async def google_login():
-    """Start Google OAuth flow"""
-    client_id = "144224946029-99vhg2ds2dhfn4i98qmkj5v88fgbtnt7.apps.googleusercontent.com"
-    redirect_uri = "https://test-six-fawn-47.vercel.app/api/auth/google/callback"
-    
-    auth_url = (
-        f"https://accounts.google.com/o/oauth2/v2/auth?"
-        f"client_id={client_id}&"
-        f"response_type=code&"
-        f"scope=openid%20email%20profile&"
-        f"redirect_uri={redirect_uri}&"
-        f"access_type=offline&"
-        f"prompt=select_account"
-    )
-    
-    return RedirectResponse(auth_url)
-
-@app.get("/api/auth/google/callback")
-async def google_callback(request: Request, response: Response, code: str = None):
-    """Handle Google OAuth callback with local time"""
-    try:
-        if not code:
-            return RedirectResponse(f"{FRONTEND_URL}/login?error=no_code")
-        
-        # Exchange code for tokens
-        token_url = "https://oauth2.googleapis.com/token"
-        data = {
-            'client_id': "144224946029-99vhg2ds2dhfn4i98qmkj5v88fgbtnt7.apps.googleusercontent.com",
-            'client_secret': "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",
-            'code': code,
-            'grant_type': 'authorization_code',
-            'redirect_uri': 'https://test-six-fawn-47.vercel.app/api/auth/google/callback'
-        }
-        
-        async with httpx.AsyncClient() as client:
-            token_response = await client.post(token_url, data=data)
-            tokens = token_response.json()
-            
-            if 'error' in tokens:
-                print(f"Token error: {tokens}")
-                return RedirectResponse(f"{FRONTEND_URL}/login?error=auth_failed")
-            
-            # Get user info from Google
-            userinfo_response = await client.get(
-                'https://www.googleapis.com/oauth2/v3/userinfo',
-                headers={'Authorization': f"Bearer {tokens['access_token']}"}
-            )
-            user_info = userinfo_response.json()
-            
-            if 'error' in user_info:
-                print(f"Userinfo error: {user_info}")
-                return RedirectResponse(f"{FRONTEND_URL}/login?error=user_info_failed")
-        
-        # Extract user data
-        email = user_info['email']
-        name = user_info.get('name', 'User')
-        google_id = user_info['sub']
-        
-        print(f"Google user: {email}, {name}, {google_id}")
-        
-        # Check if user exists by Google ID first
-        existing_user = user_by_google_id(google_id)
-        
-        if not existing_user:
-            # Check if user exists by email (merge accounts)
-            existing_user = user_by_email(email)
-            if existing_user:
-                # Update existing user with Google ID
-                update_user_google_id(email, google_id)
-            else:
-                # Create new Google user
-                if not create_google_user(email, name, google_id):
-                    return RedirectResponse(f"{FRONTEND_URL}/login?error=user_creation_failed")
-                existing_user = user_by_google_id(google_id)
-        
-        user_id = existing_user['email']
-        
-        # Get IP and User Agent
-        xff = request.headers.get("X-Forwarded-For")
-        client_ip = xff.split(",")[0].strip() if xff else request.client.host
-        user_agent = request.headers.get("User-Agent", "")[:512]
-        
-        # Update last login with local time
-        update_user_last_login(user_id)
-        
-        # Create session with local time
-        session_id = ensure_session(user_id, None, client_ip, user_agent)
-        
-        # Set cookies
-        response.set_cookie(
-            key="dp_session_id",
-            value=session_id,
-            httponly=True,
-            secure=True,
-            samesite="none",
-            max_age=30 * 24 * 60 * 60,  # 30 days
-            path="/",
-        )
-        
-        print(f"✅ Google OAuth successful for {email}, session: {session_id}")
-        
-        # Redirect to analyze page
-        return RedirectResponse(f"{FRONTEND_URL}/analyze")
-        
-    except Exception as e:
-        print(f"Google OAuth error: {e}")
-        return RedirectResponse(f"{FRONTEND_URL}/login?error=auth_failed")
-    
-@app.get("/api/usage/stats")
-async def get_usage_stats_endpoint(auth: dict = Depends(get_current_auth)):
-    """Get current user's usage statistics"""
-    try:
-        user_id = auth["user_id"]
-        
-        # Get usage stats with proper error handling
-        stats = get_usage_stats(user_id)
-        
-        # Ensure all required fields are present
-        return {
-            "today_usage": stats.get("today_usage", 0),
-            "daily_limit": stats.get("daily_limit", 1),
-            "remaining": stats.get("remaining", 1)
-        }
-        
-    except Exception as e:
-        print(f"Error in usage stats endpoint: {e}")
-        # Return safe default values
-        return {
-            "today_usage": 0,
-            "daily_limit": 1,
-            "remaining": 1
-        }
-# ---------------------------------------------------------
-# ✅ Session Management Routes
-# ---------------------------------------------------------
-@app.post("/api/session/start")
-async def start_session(request: Request, response: Response):
-    """Start or refresh user session"""
-    sid = request.cookies.get("dp_session_id")
-    xff = request.headers.get("X-Forwarded-For")
-    ip = (xff.split(",")[0].strip() if xff else None)
-    ua = request.headers.get("User-Agent")
-    ua = ua[:512] if ua else None
-
-    if sid:
-        user_email = resolve_user_from_session(sid)
-        if user_email:
-            new_sid = ensure_session(user_email, sid, ip, ua)
-            response.set_cookie(
-                key="dp_session_id",
-                value=new_sid,
-                httponly=True,
-                secure=True,
-                samesite="none",
-                path="/"
-            )
-            return {"success": True, "session_id": new_sid}
-
-    # Create anonymous session
-    anonymous_id = f"anonymous_{uuid.uuid4()}"
-    new_sid = ensure_session(anonymous_id, None, ip, ua)
-    response.set_cookie(
-        key="dp_session_id",
-        value=new_sid,
-        httponly=True,
-        secure=True,
-        samesite="none",
-        path="/"
-    )
-    return {"success": True, "session_id": new_sid, "anonymous": True}
-
-@app.get("/api/auth/me")
-async def get_current_user(auth: dict = Depends(get_current_auth)):
-    """Get current user info - useful for debugging"""
-    return {
-        "success": True,
-        "user_id": auth["user_id"],
-        "session_id": auth["session_id"],
-        "authenticated": True
-    }
-
-# ---------------------------------------------------------
-# ✅ Error Handlers
-# ---------------------------------------------------------
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request: Request, exc: HTTPException):
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={"error": exc.detail}
-    )
-
-@app.exception_handler(Exception)
-async def general_exception_handler(request: Request, exc: Exception):
-    return JSONResponse(
-        status_code=500,
-        content={"error": "Internal server error", "detail": str(exc)}
-    )
-
-# ---------------------------------------------------------
-# ✅ Startup Event - UPDATED FOR FILE CLEANUP
-# ---------------------------------------------------------
-@app.on_event("startup")
-async def startup_event():
-    """Initialize application on startup"""
-    print("🚀 DataPulse API starting up...")
-    ensure_tables()
-    print("✅ Database tables initialized")
-    
-    # Clean up expired files AND sessions on startup
-    cleaned_files = cleanup_expired_files()
-    cleaned_sessions = cleanup_expired_sessions()
-    
-    if cleaned_files > 0:
-        print(f"🧹 Cleaned up {cleaned_files} expired files")
-    if cleaned_sessions > 0:
-        print(f"🧹 Cleaned up {cleaned_sessions} expired sessions")
-    
-    # Test AI service
-    ai_service = AIService()
-    print("✅ Services initialized")
-
 # ---------------------------------------------------------
 # ✅ Vercel Handler
 # ---------------------------------------------------------
