@@ -100,18 +100,55 @@ class AISummaryRequest(BaseModel):
 ## ---------------------------------------------------------
 # ✅ Database Functions - COMPLETE SESSION MANAGEMENT
 # ---------------------------------------------------------
+## ---------------------------------------------------------
+# ✅ Database Functions - COMPLETE SESSION MANAGEMENT (Vercel Compatible)
+# ---------------------------------------------------------
+## ---------------------------------------------------------
+# ✅ Database Functions - COMPLETE SESSION MANAGEMENT (Pure Python)
+# ---------------------------------------------------------
 try:
-    import pyodbc as db_lib
-except ImportError:
+    import pymssql as db_lib
+    print("✅ pymssql imported successfully - Pure Python solution")
+except ImportError as e:
+    print(f"❌ pymssql import failed: {e}")
     try:
-        import pypyodbc as db_lib
-    except ImportError:
+        import turbodbc as db_lib
+        print("✅ turbodbc imported - Vercel compatible")
+    except ImportError as e:
+        print(f"❌ turbodbc import failed: {e}")
         db_lib = None
 
 def get_db_conn():
-    if db_lib and SQL_SERVER_CONN_STR:
-        return db_lib.connect(SQL_SERVER_CONN_STR)
-    return None
+    if not db_lib:
+        print("❌ No database library available")
+        return None
+        
+    try:
+        print(f"🔗 Attempting database connection to {DB_HOST}:{DB_PORT}")
+        
+        if 'pymssql' in str(db_lib):
+            # pymssql connection (pure Python - most compatible)
+            conn = db_lib.connect(
+                server=DB_HOST,
+                port=int(DB_PORT),
+                user=DB_UID, 
+                password=DB_PWD,
+                database=DB_NAME,
+                timeout=30
+            )
+        elif 'turbodbc' in str(db_lib):
+            # turbodbc connection
+            conn_str = f"DRIVER={{ODBC Driver 18 for SQL Server}};SERVER={DB_HOST},{DB_PORT};DATABASE={DB_NAME};UID={DB_UID};PWD={DB_PWD};Encrypt=yes;TrustServerCertificate=yes;"
+            conn = db_lib.connect(connection_string=conn_str)
+        else:
+            print("❌ Unsupported database library")
+            return None
+            
+        print("✅ Database connection successful")
+        return conn
+    except Exception as e:
+        print(f"❌ Database connection failed: {e}")
+        return None
 
 def ensure_tables():
     """Create necessary tables if they don't exist - COMPLETE SESSION MANAGEMENT"""
@@ -234,7 +271,7 @@ def check_report_eligibility(user_id: str) -> Dict[str, Any]:
         
         # ✅ CHECK IF USER IS ADMIN
         cursor.execute(
-            "SELECT is_premium, premium_expires_at, is_admin FROM users WHERE email = ?",
+            "SELECT is_premium, premium_expires_at, is_admin FROM users WHERE email = %s",
             (user_id,)
         )
         user_row = cursor.fetchone()
@@ -266,7 +303,7 @@ def check_report_eligibility(user_id: str) -> Dict[str, Any]:
         
         # Check if user is premium
         cursor.execute(
-            "SELECT is_premium, premium_expires_at FROM users WHERE email = ?",
+            "SELECT is_premium, premium_expires_at FROM users WHERE email = %s",
             (user_id,)
         )
         user_row = cursor.fetchone()
@@ -284,7 +321,7 @@ def check_report_eligibility(user_id: str) -> Dict[str, Any]:
         
         # Check today's report count
         cursor.execute(
-            "SELECT report_count, last_report_at FROM user_reports WHERE user_id = ? AND report_date = ?",
+            "SELECT report_count, last_report_at FROM user_reports WHERE user_id = %s AND report_date = %s",
             (user_id, today)
         )
         row = cursor.fetchone()
@@ -306,7 +343,7 @@ def check_report_eligibility(user_id: str) -> Dict[str, Any]:
                 else:
                     # Reset count if 24 hours have passed
                     cursor.execute(
-                        "UPDATE user_reports SET report_count = 0 WHERE user_id = ? AND report_date = ?",
+                        "UPDATE user_reports SET report_count = 0 WHERE user_id = %s AND report_date = %s",
                         (user_id, today)
                     )
                     conn.commit()
@@ -370,12 +407,12 @@ def increment_report_count(user_id: str) -> bool:
         # Insert or update report count
         cursor.execute("""
         MERGE user_reports AS target
-        USING (SELECT ? AS user_id, ? AS report_date) AS source
+        USING (SELECT %s AS user_id, %s AS report_date) AS source
         ON target.user_id = source.user_id AND target.report_date = source.report_date
         WHEN MATCHED THEN
-            UPDATE SET report_count = report_count + 1, last_report_at = ?
+            UPDATE SET report_count = report_count + 1, last_report_at = %s
         WHEN NOT MATCHED THEN
-            INSERT (user_id, report_date, report_count, last_report_at) VALUES (?, ?, 1, ?);
+            INSERT (user_id, report_date, report_count, last_report_at) VALUES (%s, %s, 1, %s);
         """, (user_id, today, current_time, user_id, today, current_time))
         
         conn.commit()
@@ -407,7 +444,7 @@ def get_user_report_stats(user_id: str) -> Dict[str, Any]:
         today = date.today()
         
         cursor.execute(
-            "SELECT report_count FROM user_reports WHERE user_id = ? AND report_date = ?",
+            "SELECT report_count FROM user_reports WHERE user_id = %s AND report_date = %s",
             (user_id, today)
         )
         row = cursor.fetchone()
@@ -447,7 +484,7 @@ def user_by_email(email: str) -> Dict[str, Any] | None:
     try:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT id, email, full_name, password_hash, google_id, created_at, last_login_at, is_premium FROM users WHERE email = ?",
+            "SELECT id, email, full_name, password_hash, google_id, created_at, last_login_at, is_premium FROM users WHERE email = %s",
             (email,)
         )
         row = cursor.fetchone()
@@ -481,7 +518,7 @@ def user_by_google_id(google_id: str) -> Dict[str, Any] | None:
     try:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT id, email, full_name, password_hash, google_id, created_at, last_login_at, is_premium FROM users WHERE google_id = ?",
+            "SELECT id, email, full_name, password_hash, google_id, created_at, last_login_at, is_premium FROM users WHERE google_id = %s",
             (google_id,)
         )
         row = cursor.fetchone()
@@ -528,7 +565,7 @@ def insert_user(full_name: Optional[str], email: str, password_hash: str) -> boo
         cursor = conn.cursor()
         current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
         cursor.execute(
-            "INSERT INTO users (full_name, email, password_hash, google_id, created_at, is_admin) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO users (full_name, email, password_hash, google_id, created_at, is_admin) VALUES (%s, %s, %s, %s, %s, %s)",
             (full_name, email, password_hash, None, current_time, is_admin)  # ✅ ADD is_admin
         )
         conn.commit()
@@ -550,7 +587,7 @@ def create_google_user(email: str, name: str, google_id: str) -> bool:
             cursor = conn.cursor()
             current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
             cursor.execute(
-                "INSERT INTO users (email, full_name, google_id, password_hash, created_at, is_admin) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO users (email, full_name, google_id, password_hash, created_at, is_admin) VALUES (%s, %s, %s, %s, %s, %s)",
                 (email, name, google_id, None, current_time, is_admin)  # ✅ ADD is_admin
             )
             conn.commit()
@@ -592,7 +629,7 @@ def create_google_user(email: str, name: str, google_id: str) -> bool:
             cursor = conn.cursor()
             current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
             cursor.execute(
-                "INSERT INTO users (email, full_name, google_id, password_hash, created_at) VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO users (email, full_name, google_id, password_hash, created_at) VALUES (%s, %s, %s, %s, %s)",
                 (email, name, google_id, None, current_time)
             )
             conn.commit()
@@ -619,7 +656,7 @@ def update_user_google_id(email: str, google_id: str) -> bool:
         if conn:
             cursor = conn.cursor()
             cursor.execute(
-                "UPDATE users SET google_id = ? WHERE email = ?",
+                "UPDATE users SET google_id = %s WHERE email = %s",
                 (google_id, email)
             )
             conn.commit()
@@ -644,7 +681,7 @@ def update_user_last_login(email: str) -> bool:
         cursor = conn.cursor()
         current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
         cursor.execute(
-            "UPDATE users SET last_login_at = ? WHERE email = ?",
+            "UPDATE users SET last_login_at = %s WHERE email = %s",
             (current_time, email)
         )
         conn.commit()
@@ -688,7 +725,7 @@ def ensure_session(user_id: str, session_id: Optional[str], ip: Optional[str], u
         cursor.execute("""
             UPDATE user_sessions 
             SET is_active = 0 
-            WHERE user_id = ? AND is_active = 1 AND session_id != ?
+            WHERE user_id = %s AND is_active = 1 AND session_id != %s
         """, (user_id, session_id or ''))
         
         deactivated_count = cursor.rowcount
@@ -699,7 +736,7 @@ def ensure_session(user_id: str, session_id: Optional[str], ip: Optional[str], u
         if session_id:
             cursor.execute(
                 """SELECT session_id, user_id FROM user_sessions 
-                   WHERE session_id = ? AND is_active = 1 AND expires_at > ?""",
+                   WHERE session_id = %s AND is_active = 1 AND expires_at > %s""",
                 (session_id, current_time_str)
             )
             existing_session = cursor.fetchone()
@@ -708,8 +745,8 @@ def ensure_session(user_id: str, session_id: Optional[str], ip: Optional[str], u
                 # Valid session for same user - update it
                 cursor.execute(
                     """UPDATE user_sessions 
-                       SET last_accessed = ?, expires_at = ?, login_method = ?
-                       WHERE session_id = ?""",
+                       SET last_accessed = %s, expires_at = %s, login_method = %s
+                       WHERE session_id = %s""",
                     (current_time_str, expires_time_str, login_method, session_id)
                 )
                 conn.commit()
@@ -722,7 +759,7 @@ def ensure_session(user_id: str, session_id: Optional[str], ip: Optional[str], u
         cursor.execute(
             """INSERT INTO user_sessions 
                (session_id, user_id, ip, user_agent, created_at, last_accessed, expires_at, is_active, login_method) 
-               VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)""",
+               VALUES (%s, %s, %s, %s, %s, %s, %s, 1, %s)""",
             (new_sid, user_id, ip, ua, current_time_str, current_time_str, expires_time_str, login_method)
         )
         conn.commit()
@@ -758,7 +795,7 @@ def resolve_user_from_session(session_id: str) -> Optional[str]:
         
         cursor.execute(
             """SELECT user_id FROM user_sessions 
-               WHERE session_id = ? AND is_active = 1 AND expires_at > ?""",
+               WHERE session_id = %s AND is_active = 1 AND expires_at > %s""",
             (session_id, current_time)
         )
         row = cursor.fetchone()
@@ -769,8 +806,8 @@ def resolve_user_from_session(session_id: str) -> Optional[str]:
             new_expires = (datetime.now() + timedelta(hours=24)).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
             cursor.execute(
                 """UPDATE user_sessions 
-                   SET last_accessed = ?, expires_at = ?
-                   WHERE session_id = ?""",
+                   SET last_accessed = %s, expires_at = %s
+                   WHERE session_id = %s""",
                 (current_time, new_expires, session_id)
             )
             conn.commit()
@@ -804,7 +841,7 @@ def resolve_user_from_session(session_id: str) -> Optional[str]:
         
         cursor.execute(
             """SELECT user_id FROM user_sessions 
-               WHERE session_id = ? AND is_active = 1 AND expires_at > ?""",
+               WHERE session_id = %s AND is_active = 1 AND expires_at > %s """,
             (session_id, current_time)
         )
         row = cursor.fetchone()
@@ -814,8 +851,8 @@ def resolve_user_from_session(session_id: str) -> Optional[str]:
             new_expires = (datetime.now() + timedelta(hours=24)).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
             cursor.execute(
                 """UPDATE user_sessions 
-                   SET last_accessed = ?, expires_at = ?
-                   WHERE session_id = ?""",
+                   SET last_accessed = %s, expires_at = %s
+                   WHERE session_id = %s""",
                 (current_time, new_expires, session_id)
             )
             conn.commit()
@@ -846,7 +883,7 @@ def cleanup_expired_sessions() -> int:
         
     try:
         cursor = conn.cursor()
-        cursor.execute("DELETE FROM user_sessions WHERE expires_at <= ?", (current_time,))
+        cursor.execute("DELETE FROM user_sessions WHERE expires_at <= %s", (current_time,))
         expired_count = cursor.rowcount
         conn.commit()
         return expired_count
@@ -882,19 +919,19 @@ def store_file_in_db(upload_id: str, file_data: bytes, filename: str, user_id: s
         current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
         expires_time = (datetime.now() + timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
         
-        cursor.execute("SELECT 1 FROM uploaded_files WHERE upload_id = ?", (upload_id,))
+        cursor.execute("SELECT 1 FROM uploaded_files WHERE upload_id = %s", (upload_id,))
         if cursor.fetchone():
             cursor.execute(
                 """UPDATE uploaded_files 
-                   SET filename = ?, file_size = ?, file_data = ?, file_type = ?, uploaded_at = ?, expires_at = ?, is_active = 1
-                   WHERE upload_id = ? AND user_id = ?""",
+                   SET filename = %s, file_size = %s, file_data = %s, file_type = %s, uploaded_at = %s, expires_at = %s, is_active = 1
+                   WHERE upload_id = %s AND user_id = %s""",
                 (filename, file_size, file_data, file_type, current_time, expires_time, upload_id, user_id)
             )
         else:
             cursor.execute(
                 """INSERT INTO uploaded_files 
                    (upload_id, user_id, filename, file_size, file_data, file_type, uploaded_at, expires_at) 
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
                 (upload_id, user_id, filename, file_size, file_data, file_type, current_time, expires_time)
             )
         
@@ -927,7 +964,7 @@ def get_file_from_db(upload_id: str, user_id: str) -> Optional[Dict[str, Any]]:
         cursor.execute(
             """SELECT upload_id, user_id, filename, file_size, file_data, file_type, uploaded_at 
                FROM uploaded_files 
-               WHERE upload_id = ? AND user_id = ? AND is_active = 1 AND expires_at > ?""",
+               WHERE upload_id = %s AND user_id = %s AND is_active = 1 AND expires_at > %s""",
             (upload_id, user_id, current_time)
         )
         row = cursor.fetchone()
@@ -967,7 +1004,7 @@ def cleanup_expired_files() -> int:
         
     try:
         cursor = conn.cursor()
-        cursor.execute("DELETE FROM uploaded_files WHERE expires_at <= ? OR is_active = 0", (current_time,))
+        cursor.execute("DELETE FROM uploaded_files WHERE expires_at <= %s OR is_active = 0", (current_time,))
         deleted_count = cursor.rowcount
         conn.commit()
         return deleted_count
@@ -1030,7 +1067,41 @@ class AISummaryRequest(BaseModel):
 # ---------------------------------------------------------
 # ✅ Routes - COMPLETE SESSION MANAGEMENT
 # ---------------------------------------------------------
-
+@app.get("/api/debug/db-connection")
+async def debug_db_connection():
+    """Test database connection with detailed info"""
+    import sys
+    
+    debug_info = {
+        "python_version": sys.version,
+        "database_library": str(db_lib) if db_lib else "None",
+        "connection_string_set": bool(SQL_SERVER_CONN_STR),
+        "environment_variables": {
+            "DB_HOST": "SET" if os.getenv("DB_HOST") else "NOT SET",
+            "DB_PORT": "SET" if os.getenv("DB_PORT") else "NOT SET", 
+            "DB_NAME": "SET" if os.getenv("DB_NAME") else "NOT SET",
+            "DB_UID": "SET" if os.getenv("DB_UID") else "NOT SET",
+            "DB_PWD": "SET" if os.getenv("DB_PWD") else "NOT SET",
+        }
+    }
+    
+    # Test connection
+    conn = get_db_conn()
+    if conn:
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT @@VERSION as version")
+            version = cursor.fetchone()[0]
+            debug_info["connection_test"] = "SUCCESS"
+            debug_info["sql_server_version"] = str(version)
+            conn.close()
+        except Exception as e:
+            debug_info["connection_test"] = "FAILED"
+            debug_info["error"] = str(e)
+    else:
+        debug_info["connection_test"] = "NO_CONNECTION"
+    
+    return debug_info
 @app.post("/api/auth/signup")
 async def signup(request: SignupRequest, response: Response):
     """User signup - REDIRECTS TO LOGIN"""
@@ -1477,7 +1548,7 @@ async def logout(request: Request, response: Response):
         if conn:
             try:
                 cursor = conn.cursor()
-                cursor.execute("DELETE FROM user_sessions WHERE session_id = ?", (sid,))
+                cursor.execute("DELETE FROM user_sessions WHERE session_id = %s", (sid,))
                 conn.commit()
                 conn.close()
                 print(f"✅ Session {sid} deleted from database")
@@ -1546,7 +1617,37 @@ async def debug_sessions():
         return {"error": str(e), "storage": "in_memory", "sessions": user_sessions}
     finally:
         conn.close()
-
+        
+@app.get("/api/test-db")
+async def test_db():
+    """Test database connection and basic queries"""
+    try:
+        conn = get_db_conn()
+        if not conn:
+            return {"status": "error", "message": "No database connection"}
+        
+        cursor = conn.cursor()
+        
+        # Test 1: Basic query
+        cursor.execute("SELECT @@VERSION as version")
+        version = cursor.fetchone()[0]
+        
+        # Test 2: Check if users table exists
+        cursor.execute("SELECT COUNT(*) FROM users")
+        users_count = cursor.fetchone()[0]
+        
+        conn.close()
+        
+        return {
+            "status": "success",
+            "database": "connected", 
+            "version": str(version),
+            "users_count": users_count
+        }
+        
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+    
 @app.get("/api/debug/reports")
 async def debug_reports():
     """Debug endpoint to see report usage"""
