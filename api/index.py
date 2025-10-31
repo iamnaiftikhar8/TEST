@@ -1450,10 +1450,10 @@ async def google_callback(request: Request, response: Response, code: str = None
         # ✅ CREATE SESSION WITH GOOGLE LOGIN METHOD
         session_id = ensure_session(user_id, None, client_ip, user_agent, "google")
         
-        # 🚨 CRITICAL FIX: Create the response FIRST, then set cookies
+        # 🚨 CRITICAL FIX: Remove domain completely for Vercel
         redirect_response = RedirectResponse(url=f"{FRONTEND_URL}/analyze")
         
-        # Set cookies on the redirect response
+        # Set cookies WITHOUT domain for Vercel
         redirect_response.set_cookie(
             key="dp_session_id",
             value=session_id,
@@ -1462,23 +1462,26 @@ async def google_callback(request: Request, response: Response, code: str = None
             samesite="none",
             max_age=30 * 24 * 60 * 60,  # 30 days
             path="/",
-            # 🚨 ADD DOMAIN for production - remove for localhost
-            domain=".vercel.app" if "vercel.app" in FRONTEND_URL else None
+            # 🚨 REMOVE domain - Vercel doesn't need it and it breaks cookies
+            # domain=None
         )
         
-        # Add headers for debugging
-        redirect_response.headers["X-Session-ID"] = session_id
-        redirect_response.headers["X-User-Email"] = email
-        
         print(f"✅ Google OAuth successful for {email}, session: {session_id}")
+        print(f"✅ Cookie set without domain for Vercel compatibility")
         print(f"✅ Redirecting to: {FRONTEND_URL}/analyze")
+        
+        # 🚨 VERIFY SESSION WAS CREATED
+        verify_user = resolve_user_from_session(session_id)
+        if verify_user:
+            print(f"✅ Session verified for user: {verify_user}")
+        else:
+            print(f"❌ Session verification FAILED for session: {session_id}")
         
         return redirect_response
         
     except Exception as e:
         print(f"Google OAuth error: {e}")
         return RedirectResponse(f"{FRONTEND_URL}/login?error=auth_failed")
-
 # ---------------------------------------------------------
 # ✅ USAGE & SESSION MANAGEMENT ROUTES
 # ---------------------------------------------------------
