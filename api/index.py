@@ -1450,8 +1450,11 @@ async def google_callback(request: Request, response: Response, code: str = None
         # ✅ CREATE SESSION WITH GOOGLE LOGIN METHOD
         session_id = ensure_session(user_id, None, client_ip, user_agent, "google")
         
-        # Set cookies
-        response.set_cookie(
+        # 🚨 CRITICAL FIX: Create the response FIRST, then set cookies
+        redirect_response = RedirectResponse(url=f"{FRONTEND_URL}/analyze")
+        
+        # Set cookies on the redirect response
+        redirect_response.set_cookie(
             key="dp_session_id",
             value=session_id,
             httponly=True,
@@ -1459,12 +1462,18 @@ async def google_callback(request: Request, response: Response, code: str = None
             samesite="none",
             max_age=30 * 24 * 60 * 60,  # 30 days
             path="/",
+            # 🚨 ADD DOMAIN for production - remove for localhost
+            domain=".vercel.app" if "vercel.app" in FRONTEND_URL else None
         )
         
-        print(f"✅ Google OAuth successful for {email}, session: {session_id}")
+        # Add headers for debugging
+        redirect_response.headers["X-Session-ID"] = session_id
+        redirect_response.headers["X-User-Email"] = email
         
-        # Redirect to analyze page
-        return RedirectResponse(f"{FRONTEND_URL}/analyze")
+        print(f"✅ Google OAuth successful for {email}, session: {session_id}")
+        print(f"✅ Redirecting to: {FRONTEND_URL}/analyze")
+        
+        return redirect_response
         
     except Exception as e:
         print(f"Google OAuth error: {e}")
