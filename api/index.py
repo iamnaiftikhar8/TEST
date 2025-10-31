@@ -1450,11 +1450,8 @@ async def google_callback(request: Request, response: Response, code: str = None
         # ✅ CREATE SESSION WITH GOOGLE LOGIN METHOD
         session_id = ensure_session(user_id, None, client_ip, user_agent, "google")
         
-        # 🚨 CRITICAL FIX: Remove domain completely for Vercel
-        redirect_response = RedirectResponse(url=f"{FRONTEND_URL}/analyze")
-        
-        # Set cookies WITHOUT domain for Vercel
-        redirect_response.set_cookie(
+        # Set cookies
+        response.set_cookie(
             key="dp_session_id",
             value=session_id,
             httponly=True,
@@ -1462,26 +1459,17 @@ async def google_callback(request: Request, response: Response, code: str = None
             samesite="none",
             max_age=30 * 24 * 60 * 60,  # 30 days
             path="/",
-            # 🚨 REMOVE domain - Vercel doesn't need it and it breaks cookies
-            # domain=None
         )
         
         print(f"✅ Google OAuth successful for {email}, session: {session_id}")
-        print(f"✅ Cookie set without domain for Vercel compatibility")
-        print(f"✅ Redirecting to: {FRONTEND_URL}/analyze")
         
-        # 🚨 VERIFY SESSION WAS CREATED
-        verify_user = resolve_user_from_session(session_id)
-        if verify_user:
-            print(f"✅ Session verified for user: {verify_user}")
-        else:
-            print(f"❌ Session verification FAILED for session: {session_id}")
-        
-        return redirect_response
+        # Redirect to analyze page
+        return RedirectResponse(f"{FRONTEND_URL}/analyze")
         
     except Exception as e:
         print(f"Google OAuth error: {e}")
         return RedirectResponse(f"{FRONTEND_URL}/login?error=auth_failed")
+
 # ---------------------------------------------------------
 # ✅ USAGE & SESSION MANAGEMENT ROUTES
 # ---------------------------------------------------------
