@@ -1,25 +1,20 @@
 # Core Requirements
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
-python-multipart==0.0.6
-pydantic==2.5.0
-httpx==0.25.2
-
+fastapi
+uvicorn
+python-multipart
+pydantic
+httpx
 # Database
-pymssql==2.2.7
-
+pymssql
 # Data Processing
-pandas==2.1.4
-numpy==1.24.3
-
+pandas
+numpy
+openpyxl
+xlrd
 # Authentication
-bcrypt==4.1.2
-
+bcrypt
 # AI
-google-generativeai==0.3.2
-
-# PDF Generation
-reportlab==4.0.7
+google-generativeai
 
 # Environment
-python-dotenv==1.0.0
+python-dotenv
