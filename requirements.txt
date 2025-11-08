@@ -9,6 +9,8 @@ pymssql
 # Data Processing
 pandas
 numpy
+openpyxl
+xlrd
 # Authentication
 bcrypt
 # AI
@@ -16,4 +18,3 @@ google-generativeai
 
 # Environment
 python-dotenv
-fpdf2
