@@ -18,4 +18,4 @@ google-generativeai
 
 # Environment
 python-dotenv
-reportlab==3.0.0
+fpdf
