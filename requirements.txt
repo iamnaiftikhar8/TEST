@@ -9,8 +9,6 @@ pymssql
 # Data Processing
 pandas
 numpy
-openpyxl
-xlrd
 # Authentication
 bcrypt
 # AI
