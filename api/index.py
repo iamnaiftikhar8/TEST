@@ -369,6 +369,7 @@ def _write_session_to_db_sync(session_data: dict):
     except Exception as e:
         print(f"Background session write error: {e}")
         
+        
 from fpdf import FPDF
 from datetime import datetime
 from typing import Dict, Any
@@ -397,7 +398,7 @@ def generate_complete_analysis_pdf(analysis_data: Dict[str, Any]) -> bytes:
         pdf.cell(0, 8, f"Filename: {file_info.get('name', 'Unknown')}", 0, 1)
         pdf.cell(0, 8, f"Size: {file_info.get('size_bytes', 0)} bytes", 0, 1)
         pdf.cell(0, 8, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", 0, 1)
-        pdf.ln(5)
+        pdf.ln(10)
         
         # Data Profiling
         pdf.set_font("Arial", "B", 16)
@@ -405,13 +406,13 @@ def generate_complete_analysis_pdf(analysis_data: Dict[str, Any]) -> bytes:
         
         profiling = analysis_data.get('profiling', {})
         profile_data = [
-            ("Total Rows", str(profiling.get('rows', 'N/A'))),
-            ("Total Columns", str(profiling.get('columns', 'N/A'))),
-            ("Missing Values", str(profiling.get('missing_total', 'N/A'))),
-            ("Numeric Columns", str(len(profiling.get('numeric_columns', [])))),
+            ["Total Rows", str(profiling.get('rows', 'N/A'))],
+            ["Total Columns", str(profiling.get('columns', 'N/A'))],
+            ["Missing Values", str(profiling.get('missing_total', 'N/A'))],
+            ["Numeric Columns", str(len(profiling.get('numeric_columns', [])))],
         ]
         
-        _create_table(pdf, profile_data, header_bg=(30, 64, 175))
+        _create_table(pdf, profile_data, header_bg=(30, 64, 175), cell_bg=(243, 244, 246))
         pdf.ln(10)
         
         # Key Performance Indicators
@@ -420,17 +421,17 @@ def generate_complete_analysis_pdf(analysis_data: Dict[str, Any]) -> bytes:
         
         kpis = analysis_data.get('kpis', {})
         kpi_data = [
-            ("Metric", "Value"),
-            ("Total Rows", str(kpis.get('total_rows', 'N/A'))),
-            ("Total Columns", str(kpis.get('total_columns', 'N/A'))),
-            ("Missing Data %", f"{kpis.get('missing_pct', 'N/A')}%"),
-            ("Duplicate Rows", str(kpis.get('duplicate_rows', 'N/A'))),
-            ("Statistical Outliers", str(kpis.get('outliers_total', 'N/A'))),
+            ["Metric", "Value"],
+            ["Total Rows", str(kpis.get('total_rows', 'N/A'))],
+            ["Total Columns", str(kpis.get('total_columns', 'N/A'))],
+            ["Missing Data %", f"{kpis.get('missing_pct', 'N/A')}%"],
+            ["Duplicate Rows", str(kpis.get('duplicate_rows', 'N/A'))],
+            ["Statistical Outliers", str(kpis.get('outliers_total', 'N/A'))],
         ]
         if kpis.get('rows_per_day'):
-            kpi_data.append(("Rows Per Day", str(kpis.get('rows_per_day'))))
+            kpi_data.append(["Rows Per Day", str(kpis.get('rows_per_day'))])
         
-        _create_table(pdf, kpi_data, header_bg=(5, 150, 105))
+        _create_table(pdf, kpi_data, header_bg=(5, 150, 105), cell_bg=(209, 250, 229))
         pdf.ln(10)
         
         # AI Insights and Summary
@@ -567,20 +568,19 @@ def generate_complete_analysis_pdf(analysis_data: Dict[str, Any]) -> bytes:
         # Fallback to simple PDF
         return generate_simple_pdf(analysis_data)
 
-def _create_table(pdf, data, header_bg=(0, 0, 0)):
+def _create_table(pdf, data, header_bg=(0, 0, 0), cell_bg=(255, 255, 255)):
     """Helper function to create styled tables"""
-    col_width = 95 if len(data[0]) == 2 else 63
+    col_width = 95
     row_height = 10
     
     for i, row in enumerate(data):
-        is_header = i == 0
         for j, cell in enumerate(row):
-            if is_header:
+            if i == 0:  # Header row
                 pdf.set_fill_color(*header_bg)
                 pdf.set_text_color(255, 255, 255)
                 pdf.set_font("Arial", "B", 12)
-            else:
-                pdf.set_fill_color(243, 244, 246)
+            else:  # Data rows
+                pdf.set_fill_color(*cell_bg)
                 pdf.set_text_color(0, 0, 0)
                 pdf.set_font("Arial", "", 12)
             
