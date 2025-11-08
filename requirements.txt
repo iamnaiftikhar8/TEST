@@ -14,7 +14,7 @@ openpyxl
 xlrd
 # Authentication
 bcrypt
-
+scipy
 # AI
 google-generativeai
 

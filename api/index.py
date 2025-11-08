@@ -7,10 +7,12 @@ import hashlib
 import uuid
 import httpx
 import bcrypt
+import textwrap  # ADD THIS IMPORT
 from datetime import datetime, date, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 import google.generativeai as genai
-
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Response, Query, Depends, status, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -19,9 +21,9 @@ from pydantic import BaseModel, EmailStr
 # ---------------------------------------------------------
 # ✅ Configuration
 # ---------------------------------------------------------
-FRONTEND_URL = os.getenv("FRONTEND_URL", "https://data-pulse-one.vercel.app")
+FRONTEND_URL = os.getenv("FRONTEND_URL")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyBe8E5aR-g5ecP7OThZB6S_Sg-A2RAZ3bk")
-FREE_REPORTS_PER_DAY = 4
+
 
 # Database configuration
 DB_HOST = os.getenv("DB_HOST", "mssql-196323-0.cloudclusters.net")
@@ -96,12 +98,13 @@ class AISummaryRequest(BaseModel):
     include_predictions: bool = True
     include_benchmarks: bool = True
     include_risk_assessment: bool = True
+    
 ## ---------------------------------------------------------
-# ✅ Database Functions - COMPLETE SESSION MANAGEMENT (Pure Python)
+# ✅ Database Functions - COMPLETE SESSION MANAGEMENT 
 # ---------------------------------------------------------
 try:
     import pymssql as db_lib
-    print("✅ pymssql imported successfully - Pure Python solution")
+    print("✅ pymssql imported successfully ")
 except ImportError as e:
     print(f"❌ pymssql import failed: {e}")
     db_lib = None
@@ -151,7 +154,7 @@ def ensure_tables():
             created_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
             last_login_at DATETIME2 NULL,
             is_premium BIT NOT NULL DEFAULT 0,
-            is_admin BIT NOT NULL DEFAULT 0,  -- ✅ NEW: Admin flag
+            is_admin BIT NOT NULL DEFAULT 0,  
             premium_expires_at DATETIME2 NULL
         )
         """)
@@ -202,6 +205,19 @@ def ensure_tables():
             is_active BIT NOT NULL DEFAULT 1
         )
         """)
+        cursor.execute("""
+        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='pdf_reports' AND xtype='U')
+        CREATE TABLE pdf_reports (
+            id NVARCHAR(64) NOT NULL PRIMARY KEY,
+            user_id NVARCHAR(128) NOT NULL,
+            upload_id NVARCHAR(64) NOT NULL,
+            filename NVARCHAR(255) NOT NULL,
+            original_filename NVARCHAR(255) NOT NULL,
+            file_size BIGINT NOT NULL,
+            pdf_data VARBINARY(MAX) NOT NULL,
+            created_at DATETIME2 NOT NULL DEFAULT SYSDATETIME()
+        )
+        """)
         
         conn.commit()
         print("✅ Database tables ensured")
@@ -210,20 +226,402 @@ def ensure_tables():
     finally:
         conn.close()
 
+
+# ✅ ADD THESE NEW FAST FUNCTIONS AFTER YOUR EXISTING DATABASE FUNCTIONS:
+
+def user_by_email_fast(email: str) -> Dict[str, Any] | None:
+    """Ultra-fast user lookup - only essential fields"""
+    conn = get_db_conn()
+    if not conn:
+        user_data = users_db.get(email)
+        if user_data:
+            return {
+                'email': user_data.get('email'),
+                'password_hash': user_data.get('password_hash'),
+                'full_name': user_data.get('full_name')
+            }
+        return None
+        
+    try:
+        cursor = conn.cursor()
+        # Only select needed fields for login
+        cursor.execute(
+            "SELECT email, password_hash, full_name FROM users WHERE email = %s",
+            (email,)
+        )
+        row = cursor.fetchone()
+        if row:
+            return {
+                'email': row[0],
+                'password_hash': row[1],
+                'full_name': row[2]
+            }
+        return None
+    except Exception as e:
+        print(f"Fast user lookup error: {e}")
+        user_data = users_db.get(email)
+        if user_data:
+            return {
+                'email': user_data.get('email'),
+                'password_hash': user_data.get('password_hash'),
+                'full_name': user_data.get('full_name')
+            }
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+def ensure_session_fast(user_id: str, ip: Optional[str], ua: Optional[str]) -> str:
+    """Fast session creation without complex checks"""
+    current_time = datetime.now()
+    expires_time = current_time + timedelta(hours=24)
+    
+    # In-memory session for speed
+    new_sid = str(uuid.uuid4())
+    user_sessions[new_sid] = {
+        'user_id': user_id,
+        'created_at': current_time,
+        'last_accessed': current_time,
+        'login_method': 'email'
+    }
+    
+    # Queue database write for background
+    asyncio.create_task(write_session_to_db_background({
+        'session_id': new_sid,
+        'user_id': user_id,
+        'ip': ip,
+        'user_agent': ua,
+        'created_at': current_time,
+        'expires_at': expires_time
+    }))
+    
+    print(f"🚀 Fast session created: {new_sid} for user: {user_id}")
+    return new_sid
+
+# ✅ ADD BACKGROUND PROCESSING FUNCTIONS:
+# Thread pool for background tasks
+background_executor = ThreadPoolExecutor(max_workers=2)
+
+async def update_last_login_background(email: str):
+    """Update last login in background without blocking response"""
+    try:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            background_executor, 
+            _update_last_login_sync, 
+            email
+        )
+    except Exception as e:
+        print(f"Background last login update error: {e}")
+
+def _update_last_login_sync(email: str):
+    """Sync function for background last login update"""
+    try:
+        conn = get_db_conn()
+        if conn:
+            cursor = conn.cursor()
+            current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+            cursor.execute(
+                "UPDATE users SET last_login_at = %s WHERE email = %s",
+                (current_time, email)
+            )
+            conn.commit()
+            conn.close()
+            print(f"✅ Background last login updated for: {email}")
+    except Exception as e:
+        print(f"Background last login error: {e}")
+
+async def write_session_to_db_background(session_data: dict):
+    """Write session to database in background"""
+    try:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            background_executor,
+            _write_session_to_db_sync,
+            session_data
+        )
+    except Exception as e:
+        print(f"Background session write error: {e}")
+
+def _write_session_to_db_sync(session_data: dict):
+    """Actual database write called from background thread"""
+    try:
+        conn = get_db_conn()
+        if conn:
+            cursor = conn.cursor()
+            
+            current_time_str = session_data['created_at'].strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+            expires_time_str = session_data['expires_at'].strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+            
+            cursor.execute(
+                """INSERT INTO user_sessions 
+                   (session_id, user_id, ip, user_agent, created_at, last_accessed, expires_at, is_active, login_method) 
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, 1, %s)""",
+                (session_data['session_id'], session_data['user_id'], session_data['ip'], 
+                 session_data['user_agent'], current_time_str, current_time_str, 
+                 expires_time_str, 'email')
+            )
+            conn.commit()
+            conn.close()
+            print(f"✅ Background session saved: {session_data['session_id']}")
+    except Exception as e:
+        print(f"Background session write error: {e}")
+        
+        # PDF CREATION
+def generate_complete_analysis_pdf(analysis_data: Dict[str, Any]) -> bytes:
+    """Generate a complete PDF with all analysis data"""
+    try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.pdfgen import canvas
+        from reportlab.lib.styles import getSampleStyleSheet
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+        from reportlab.lib.units import inch
+        from reportlab.lib import colors
+        from io import BytesIO
+        import textwrap
+
+        buffer = BytesIO()
+        doc = SimpleDocTemplate(
+            buffer, 
+            pagesize=A4,
+            rightMargin=72, 
+            leftMargin=72,
+            topMargin=72, 
+            bottomMargin=18
+        )
+        
+        styles = getSampleStyleSheet()
+        story = []
+        
+        # Title
+        title_style = styles["Heading1"]
+        story.append(Paragraph("DataPulse AI Analysis Report", title_style))
+        story.append(Spacer(1, 20))
+        
+        # File Information
+        story.append(Paragraph("<b>File Information</b>", styles["Heading2"]))
+        file_info = analysis_data.get('file', {})
+        story.append(Paragraph(f"<b>Filename:</b> {file_info.get('name', 'Unknown')}", styles["Normal"]))
+        story.append(Paragraph(f"<b>Size:</b> {file_info.get('size_bytes', 0)} bytes", styles["Normal"]))
+        story.append(Paragraph(f"<b>Generated:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", styles["Normal"]))
+        story.append(Spacer(1, 20))
+        
+        # Data Profiling
+        profiling = analysis_data.get('profiling', {})
+        story.append(Paragraph("<b>Data Profiling</b>", styles["Heading2"]))
+        
+        profile_data = [
+            ["Total Rows", str(profiling.get('rows', 'N/A'))],
+            ["Total Columns", str(profiling.get('columns', 'N/A'))],
+            ["Missing Values", str(profiling.get('missing_total', 'N/A'))],
+            ["Numeric Columns", str(len(profiling.get('numeric_columns', [])))],
+        ]
+        
+        profile_table = Table(profile_data, colWidths=[2*inch, 1*inch])
+        profile_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1E40AF')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 12),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#F3F4F6')),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black)
+        ]))
+        story.append(profile_table)
+        story.append(Spacer(1, 20))
+        
+        # Key Performance Indicators
+        kpis = analysis_data.get('kpis', {})
+        story.append(Paragraph("<b>Key Performance Indicators</b>", styles["Heading2"]))
+        
+        kpi_data = [
+            ["Metric", "Value"],
+            ["Total Rows", str(kpis.get('total_rows', 'N/A'))],
+            ["Total Columns", str(kpis.get('total_columns', 'N/A'))],
+            ["Missing Data %", f"{kpis.get('missing_pct', 'N/A')}%"],
+            ["Duplicate Rows", str(kpis.get('duplicate_rows', 'N/A'))],
+            ["Statistical Outliers", str(kpis.get('outliers_total', 'N/A'))],
+        ]
+        if kpis.get('rows_per_day'):
+            kpi_data.append(["Rows Per Day", str(kpis.get('rows_per_day'))])
+        
+        kpi_table = Table(kpi_data, colWidths=[2*inch, 1.5*inch])
+        kpi_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#059669')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#D1FAE5')),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black)
+        ]))
+        story.append(kpi_table)
+        story.append(Spacer(1, 20))
+        
+        # AI Insights and Summary
+        insights = analysis_data.get('insights', {})
+        detailed_summary = analysis_data.get('detailed_summary', {})
+        
+        story.append(Paragraph("<b>AI Executive Summary</b>", styles["Heading2"]))
+        
+        # Executive Overview
+        if detailed_summary.get('executive_overview'):
+            story.append(Paragraph("<b>Overview</b>", styles["Heading3"]))
+            story.append(Paragraph(detailed_summary['executive_overview'], styles["Normal"]))
+            story.append(Spacer(1, 12))
+        
+        # Key Insights
+        if insights.get('key_insights'):
+            story.append(Paragraph("<b>Key Insights</b>", styles["Heading3"]))
+            for insight in insights['key_insights']:
+                story.append(Paragraph(f"• {insight}", styles["Normal"]))
+            story.append(Spacer(1, 12))
+        
+        # Data Quality Assessment
+        if detailed_summary.get('data_quality_assessment'):
+            story.append(Paragraph("<b>Data Quality</b>", styles["Heading3"]))
+            story.append(Paragraph(detailed_summary['data_quality_assessment'], styles["Normal"]))
+            story.append(Spacer(1, 12))
+        
+        # Key Trends & Patterns - FIXED FIELD NAME
+        if detailed_summary.get('key_trends'):
+            story.append(Paragraph("<b>Key Trends & Patterns</b>", styles["Heading3"]))
+            for trend in detailed_summary['key_trends']:
+                story.append(Paragraph(f"• {trend}", styles["Normal"]))
+            story.append(Spacer(1, 12))
+        
+        # Business Implications - FIXED FIELD NAME
+        if detailed_summary.get('business_implications'):
+            story.append(Paragraph("<b>Business Implications</b>", styles["Heading3"]))
+            for implication in detailed_summary['business_implications']:
+                story.append(Paragraph(f"• {implication}", styles["Normal"]))
+            story.append(Spacer(1, 12))
+        
+        # Recommendations
+        if detailed_summary.get('recommendations'):
+            recs = detailed_summary['recommendations']
+            if recs.get('short_term'):
+                story.append(Paragraph("<b>Short-term Recommendations (0-3 months)</b>", styles["Heading3"]))
+                for rec in recs['short_term']:
+                    story.append(Paragraph(f"• {rec}", styles["Normal"]))
+                story.append(Spacer(1, 12))
+            
+            if recs.get('long_term'):
+                story.append(Paragraph("<b>Long-term Strategies (3-12 months)</b>", styles["Heading3"]))
+                for rec in recs['long_term']:
+                    story.append(Paragraph(f"• {rec}", styles["Normal"]))
+                story.append(Spacer(1, 12))
+        
+        # Immediate Quick Wins - FIXED FIELD NAME
+        if detailed_summary.get('action_items_quick_wins'):
+            story.append(Paragraph("<b>Immediate Quick Wins</b>", styles["Heading3"]))
+            for win in detailed_summary['action_items_quick_wins']:
+                story.append(Paragraph(f"• {win}", styles["Normal"]))
+            story.append(Spacer(1, 12))
+        
+        # Risk Alerts
+        if detailed_summary.get('risk_alerts'):
+            story.append(Paragraph("<b>Risk Alerts</b>", styles["Heading3"]))
+            for risk in detailed_summary['risk_alerts']:
+                story.append(Paragraph(f" {risk}", styles["Normal"]))
+            story.append(Spacer(1, 12))
+        
+        # Predictive Insights - FIXED FIELD NAME
+        if detailed_summary.get('predictive_insights'):
+            story.append(Paragraph("<b>Predictive Insights</b>", styles["Heading3"]))
+            for insight in detailed_summary['predictive_insights']:
+                story.append(Paragraph(f"• {insight}", styles["Normal"]))
+            story.append(Spacer(1, 12))
+        
+        # Industry Benchmarking - FIXED FIELD NAME
+        if detailed_summary.get('industry_comparison'):
+            story.append(Paragraph("<b>Industry Benchmarking</b>", styles["Heading3"]))
+            story.append(Paragraph(detailed_summary['industry_comparison'], styles["Normal"]))
+            story.append(Spacer(1, 12))
+        
+        # Build the PDF
+        doc.build(story)
+        buffer.seek(0)
+        pdf_data = buffer.getvalue()
+        
+        print(f"📊 Complete PDF generated: {len(pdf_data)} bytes")
+        
+        # Debug: Print available fields
+        print(f"🔍 Available detailed_summary fields: {list(detailed_summary.keys())}")
+        for key, value in detailed_summary.items():
+            if isinstance(value, list):
+                print(f"  {key}: {len(value)} items")
+            else:
+                print(f"  {key}: {type(value)}")
+        
+        return pdf_data
+        
+    except Exception as e:
+        print(f"❌ PDF generation error: {e}")
+        import traceback
+        traceback.print_exc()
+        # Fallback to simple PDF
+        return generate_simple_pdf(analysis_data)
+
+def generate_simple_pdf(analysis_data: Dict[str, Any]) -> bytes:
+    """Fallback simple PDF generator"""
+    from reportlab.pdfgen import canvas
+    from io import BytesIO
+    
+    buffer = BytesIO()
+    p = canvas.Canvas(buffer)
+    
+    p.setFont("Helvetica-Bold", 16)
+    p.drawString(100, 800, "DataPulse Analysis Report")
+    
+    p.setFont("Helvetica", 12)
+    p.drawString(100, 770, f"File: {analysis_data.get('file', {}).get('name', 'Unknown')}")
+    p.drawString(100, 750, f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    
+    # Add basic info
+    y = 720
+    kpis = analysis_data.get('kpis', {})
+    if kpis:
+        p.drawString(100, y, f"Rows: {kpis.get('total_rows', 'N/A')}")
+        y -= 20
+        p.drawString(100, y, f"Columns: {kpis.get('total_columns', 'N/A')}")
+        y -= 20
+        p.drawString(100, y, f"Missing Data: {kpis.get('missing_pct', 'N/A')}%")
+        y -= 20
+    
+    insights = analysis_data.get('insights', {})
+    if insights.get('summary'):
+        p.drawString(100, y, "Summary:")
+        y -= 20
+        # Split long text
+        summary = insights['summary']
+        lines = textwrap.wrap(summary, width=60)
+        for line in lines[:5]:  # Limit to 5 lines
+            if y < 100:
+                p.showPage()
+                y = 800
+            p.drawString(120, y, line)
+            y -= 15
+    
+    p.save()
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
 # ---------------------------------------------------------
 # ✅ USAGE LIMIT MANAGEMENT
 # ---------------------------------------------------------
 
 def check_report_eligibility(user_id: str) -> Dict[str, Any]:
     """
-    Check if user can generate a report
+    Check if user can generate a report - FIXED VERSION
     Returns: {
         "can_generate": bool,
         "reason": str,
         "next_available": datetime | None,
         "is_premium": bool,
-        "is_admin": bool  # ✅ NEW
-
+        "is_admin": bool  
     }
     """
     conn = get_db_conn()
@@ -232,7 +630,6 @@ def check_report_eligibility(user_id: str) -> Dict[str, Any]:
         today = date.today().isoformat()
         user_today_reports = user_reports.get(user_id, {}).get(today, 0)
         
-          # ✅ CHECK IN-MEMORY ADMIN STATUS
         user_data = users_db.get(user_id, {})
         is_admin = user_data.get('is_admin', False)
         
@@ -242,8 +639,7 @@ def check_report_eligibility(user_id: str) -> Dict[str, Any]:
             "reason": "DAILY_LIMIT_REACHED" if not can_generate else "ELIGIBLE",
             "next_available": None if can_generate else datetime.now() + timedelta(days=1),
             "is_premium": False,
-            "is_admin": is_admin  # ✅ ADD THIS
-
+            "is_admin": is_admin  
         }
         
     try:
@@ -258,7 +654,7 @@ def check_report_eligibility(user_id: str) -> Dict[str, Any]:
         
         is_premium = user_row[0] if user_row else False
         premium_expires = user_row[1] if user_row else None
-        is_admin = user_row[2] if user_row else False  # ✅ GET ADMIN STATUS
+        is_admin = user_row[2] if user_row else False  
         
         # ✅ ADMIN USERS HAVE UNLIMITED REPORTS
         if is_admin:
@@ -270,7 +666,7 @@ def check_report_eligibility(user_id: str) -> Dict[str, Any]:
                 "is_admin": True
             }
         
-        # Premium users with valid subscription have unlimited reports
+        # ✅ PREMIUM USERS HAVE UNLIMITED REPORTS
         if is_premium and premium_expires and premium_expires > datetime.now():
             return {
                 "can_generate": True,
@@ -279,27 +675,10 @@ def check_report_eligibility(user_id: str) -> Dict[str, Any]:
                 "is_premium": True,
                 "is_admin": False
             }
+        
         today = date.today()
         
-        # Check if user is premium
-        cursor.execute(
-            "SELECT is_premium, premium_expires_at FROM users WHERE email = %s",
-            (user_id,)
-        )
-        user_row = cursor.fetchone()
-        is_premium = user_row[0] if user_row else False
-        premium_expires = user_row[1] if user_row else None
-        
-        # Premium users have unlimited reports
-        if is_premium and premium_expires and premium_expires > datetime.now():
-            return {
-                "can_generate": True,
-                "reason": "PREMIUM_USER",
-                "next_available": None,
-                "is_premium": True
-            }
-        
-        # Check today's report count
+        # ✅ CHECK TODAY'S REPORT COUNT - READ ONLY, NO UPDATES!
         cursor.execute(
             "SELECT report_count, last_report_at FROM user_reports WHERE user_id = %s AND report_date = %s",
             (user_id, today)
@@ -318,22 +697,16 @@ def check_report_eligibility(user_id: str) -> Dict[str, Any]:
                         "next_available": next_available,
                         "is_premium": False,
                         "is_admin": False
-
                     }
                 else:
-                    # Reset count if 24 hours have passed
-                    cursor.execute(
-                        "UPDATE user_reports SET report_count = 0 WHERE user_id = %s AND report_date = %s",
-                        (user_id, today)
-                    )
-                    conn.commit()
+                    # 🚨 CRITICAL FIX: Don't reset here - let increment_report_count handle it
+                    # The record will be updated when user actually generates a report
                     return {
                         "can_generate": True,
-                        "reason": "ELIGIBLE",
+                        "reason": "ELIGIBLE_AFTER_COOLDOWN",
                         "next_available": None,
                         "is_premium": False,
-                       "is_admin": False
-
+                        "is_admin": False
                     }
             else:
                 return {
@@ -342,34 +715,31 @@ def check_report_eligibility(user_id: str) -> Dict[str, Any]:
                     "next_available": None,
                     "is_premium": False,
                     "is_admin": False
-
                 }
         else:
-            # No reports today
+            # No reports today - user is eligible
             return {
                 "can_generate": True,
                 "reason": "ELIGIBLE",
                 "next_available": None,
                 "is_premium": False,
                 "is_admin": False
-
             }
             
     except Exception as e:
         print(f"Report eligibility error: {e}")
         return {
-            "can_generate": True,  # Fail open for errors
+            "can_generate": True,  
             "reason": "ERROR",
             "next_available": None,
             "is_premium": False,
             "is_admin": False
-
         }
     finally:
         conn.close()
 
 def increment_report_count(user_id: str) -> bool:
-    """Increment user's report count for today"""
+    """Increment user's report count for today - ENHANCED VERSION"""
     conn = get_db_conn()
     if not conn:
         # Fallback to in-memory storage
@@ -384,7 +754,25 @@ def increment_report_count(user_id: str) -> bool:
         today = date.today()
         current_time = datetime.now()
         
-        # Insert or update report count
+        # ✅ FIRST: Check if we need to reset due to 24-hour cooldown
+        cursor.execute(
+            "SELECT report_count, last_report_at FROM user_reports WHERE user_id = %s AND report_date = %s",
+            (user_id, today)
+        )
+        existing_record = cursor.fetchone()
+        
+        if existing_record:
+            report_count, last_report_at = existing_record
+            # If 24 hours have passed since last report, reset the count
+            if report_count >= 1 and last_report_at and (current_time - last_report_at) >= timedelta(hours=24):
+                cursor.execute(
+                    "UPDATE user_reports SET report_count = 0, last_report_at = %s WHERE user_id = %s AND report_date = %s",
+                    (current_time, user_id, today)
+                )
+                conn.commit()
+                print(f"🔄 Reset report count for {user_id} after 24-hour cooldown")
+        
+        # ✅ NOW: Insert or update report count
         cursor.execute("""
         MERGE user_reports AS target
         USING (SELECT %s AS user_id, %s AS report_date) AS source
@@ -414,7 +802,7 @@ def get_user_report_stats(user_id: str) -> Dict[str, Any]:
             "reason": eligibility["reason"],
             "next_available": eligibility["next_available"],
             "is_premium": eligibility["is_premium"],
-            "is_admin": eligibility["is_admin"],  # ✅ ADD THIS
+            "is_admin": eligibility["is_admin"],  
             "today_used": user_reports.get(user_id, {}).get(date.today().isoformat(), 0),
             "daily_limit": 1
         }
@@ -436,7 +824,7 @@ def get_user_report_stats(user_id: str) -> Dict[str, Any]:
             "next_available": eligibility["next_available"],
             "is_premium": eligibility["is_premium"],
             "today_used": today_used,
-            "daily_limit": "∞" if eligibility["is_admin"] else 1  # ✅ SHOW INFINITY FOR ADMINS
+            "daily_limit": "∞" if eligibility["is_admin"] else 1  
         }
     except Exception as e:
         print(f"Get report stats error: {e}")
@@ -520,6 +908,55 @@ def user_by_google_id(google_id: str) -> Dict[str, Any] | None:
     finally:
         conn.close()
 
+def create_oauth_session(user_id: str, ip: Optional[str], ua: Optional[str]) -> str:
+    """Create session specifically for OAuth without deactivating others"""
+    conn = get_db_conn()
+    
+    current_time = datetime.now()
+    expires_time = current_time + timedelta(hours=24)
+    
+    current_time_str = current_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+    expires_time_str = expires_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+    
+    if not conn:
+        # In-memory session
+        new_sid = str(uuid.uuid4())
+        user_sessions[new_sid] = {
+            'user_id': user_id,
+            'created_at': current_time,
+            'last_accessed': current_time,
+            'login_method': 'google'
+        }
+        return new_sid
+        
+    try:
+        cursor = conn.cursor()
+        
+        # 🚨 FIX: Don't deactivate other sessions during OAuth
+        # Just create a new session
+        new_sid = str(uuid.uuid4())
+        cursor.execute(
+            """INSERT INTO user_sessions 
+               (session_id, user_id, ip, user_agent, created_at, last_accessed, expires_at, is_active, login_method) 
+               VALUES (%s, %s, %s, %s, %s, %s, %s, 1, %s)""",
+            (new_sid, user_id, ip, ua, current_time_str, current_time_str, expires_time_str, 'google')
+        )
+        conn.commit()
+        conn.close()
+        return new_sid
+        
+    except Exception as e:
+        print(f"❌ OAuth session creation error: {e}")
+        # Fallback to in-memory
+        new_sid = str(uuid.uuid4())
+        user_sessions[new_sid] = {
+            'user_id': user_id,
+            'created_at': current_time,
+            'last_accessed': current_time,
+            'login_method': 'google'
+        }
+        return new_sid
+
 def insert_user(full_name: Optional[str], email: str, password_hash: str) -> bool:
     """Insert new user into database with admin check"""
     conn = get_db_conn()
@@ -537,7 +974,7 @@ def insert_user(full_name: Optional[str], email: str, password_hash: str) -> boo
             'google_id': None,
             'created_at': datetime.now().isoformat(),
             'is_premium': False,
-            'is_admin': is_admin  # ✅ ADD ADMIN FLAG
+            'is_admin': is_admin  
         }
         return True
         
@@ -546,7 +983,7 @@ def insert_user(full_name: Optional[str], email: str, password_hash: str) -> boo
         current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
         cursor.execute(
             "INSERT INTO users (full_name, email, password_hash, google_id, created_at, is_admin) VALUES (%s, %s, %s, %s, %s, %s)",
-            (full_name, email, password_hash, None, current_time, is_admin)  # ✅ ADD is_admin
+            (full_name, email, password_hash, None, current_time, is_admin)  
         )
         conn.commit()
         return True
@@ -568,7 +1005,7 @@ def create_google_user(email: str, name: str, google_id: str) -> bool:
             current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
             cursor.execute(
                 "INSERT INTO users (email, full_name, google_id, password_hash, created_at, is_admin) VALUES (%s, %s, %s, %s, %s, %s)",
-                (email, name, google_id, None, current_time, is_admin)  # ✅ ADD is_admin
+                (email, name, google_id, None, current_time, is_admin)  
             )
             conn.commit()
             conn.close()
@@ -581,7 +1018,7 @@ def create_google_user(email: str, name: str, google_id: str) -> bool:
                 'password_hash': None,
                 'created_at': datetime.now().isoformat(),
                 'is_premium': False,
-                'is_admin': is_admin  # ✅ ADD ADMIN FLAG
+                'is_admin': is_admin  
             }
             return True
     except Exception as e:
@@ -592,9 +1029,10 @@ def check_if_admin_email(email: str) -> bool:
     """Check if email is in the admin whitelist"""
     admin_emails = {
         "gms-world@gmail.com",
-        "admin@datapulse.com", 
-        "developer@datapulse.com",
-        "sap.admin@gms-world.com"
+        "saqibaltaf27@gmail.com",
+        "iamnaiftikhar8@gmail.com",
+        "sap.admin@gms-world.com",
+        
         # Add more admin emails here
     }
     
@@ -805,47 +1243,6 @@ def resolve_user_from_session(session_id: str) -> Optional[str]:
         if conn:
             conn.close()
             
-def resolve_user_from_session(session_id: str) -> Optional[str]:
-    """Resolve user from session with proper session management"""
-    if not session_id:
-        return None
-        
-    conn = get_db_conn()
-    if not conn:
-        session_data = user_sessions.get(session_id)
-        return session_data.get('user_id') if session_data else None
-        
-    try:
-        cursor = conn.cursor()
-        current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
-        
-        cursor.execute(
-            """SELECT user_id FROM user_sessions 
-               WHERE session_id = %s AND is_active = 1 AND expires_at > %s """,
-            (session_id, current_time)
-        )
-        row = cursor.fetchone()
-        
-        if row:
-            # Update session expiry when accessed
-            new_expires = (datetime.now() + timedelta(hours=24)).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
-            cursor.execute(
-                """UPDATE user_sessions 
-                   SET last_accessed = %s, expires_at = %s
-                   WHERE session_id = %s""",
-                (current_time, new_expires, session_id)
-            )
-            conn.commit()
-            return row[0]
-        return None
-        
-    except Exception as e:
-        print(f"❌ Session resolve error: {e}")
-        session_data = user_sessions.get(session_id)
-        return session_data.get('user_id') if session_data else None
-    finally:
-        if conn:
-            conn.close()
 
 def cleanup_expired_sessions() -> int:
     """Clean up expired sessions"""
@@ -1006,6 +1403,8 @@ def get_current_auth(request: Request):
     """Get current authenticated user with better error handling"""
     sid = request.cookies.get("dp_session_id")
     
+    print(f"🔍 Checking auth - Session ID from cookies: {sid}")
+    
     if not sid:
         print("❌ No session ID in cookies")
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
@@ -1026,27 +1425,359 @@ def get_current_auth(request: Request):
     
     print(f"✅ Authenticated user: {user_email}, session: {new_sid}")
     return {"user_id": user_email, "session_id": new_sid}
-# ---------------------------------------------------------
-# ✅ Pydantic Models
-# ---------------------------------------------------------
-class SignupRequest(BaseModel):
-    full_name: str
-    email: str
-    password: str
 
-class LoginRequest(BaseModel):
-    email: str
-    password: str
-    remember: bool = False
-
-class AISummaryRequest(BaseModel):
-    upload_id: str
-    business_goal: Optional[str] = None
-    audience: Optional[str] = "executive"
-
+def store_pdf_report(user_id: str, upload_id: str, pdf_data: bytes, filename: str, original_filename: str) -> str:
+    """Store PDF report in database"""
+    conn = get_db_conn()
+    pdf_id = str(uuid.uuid4())
+    
+    if not conn:
+        # Fallback to in-memory storage
+        if 'pdf_reports' not in uploaded_files:
+            uploaded_files['pdf_reports'] = {}
+        uploaded_files['pdf_reports'][pdf_id] = {
+            'user_id': user_id,
+            'pdf_data': pdf_data,
+            'filename': filename,
+            'original_filename': original_filename,
+            'upload_id': upload_id,
+            'created_at': datetime.now(),
+            'file_size': len(pdf_data)
+        }
+        return pdf_id
+        
+    try:
+        cursor = conn.cursor()
+        current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+        file_size = len(pdf_data)
+        
+        cursor.execute(
+            """INSERT INTO pdf_reports 
+               (id, user_id, upload_id, filename, original_filename, file_size, pdf_data, created_at) 
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+            (pdf_id, user_id, upload_id, filename, original_filename, file_size, pdf_data, current_time)
+        )
+        conn.commit()
+        print(f"✅ PDF stored in database: {pdf_id}")
+        return pdf_id
+    except Exception as e:
+        print(f"❌ PDF storage error: {e}")
+        # Fallback to in-memory
+        if 'pdf_reports' not in uploaded_files:
+            uploaded_files['pdf_reports'] = {}
+        uploaded_files['pdf_reports'][pdf_id] = {
+            'user_id': user_id,
+            'pdf_data': pdf_data,
+            'filename': filename,
+            'original_filename': original_filename,
+            'upload_id': upload_id,
+            'created_at': datetime.now(),
+            'file_size': len(pdf_data)
+        }
+        return pdf_id
+    finally:
+        if conn:
+            conn.close()
 # ---------------------------------------------------------
 # ✅ Routes - COMPLETE SESSION MANAGEMENT
 # ---------------------------------------------------------
+@app.post("/api/export-pdf")
+async def export_pdf_report(
+    auth: dict = Depends(get_current_auth),
+    upload_id: str = Body(..., embed=True),
+    analysis_data: Dict[str, Any] = Body(..., embed=True)
+):
+    user_id = auth["user_id"]
+    
+    print(f"📄 COMPLETE PDF Export requested by {user_id}")
+    print(f"📊 Analysis data type: {type(analysis_data)}")
+    print(f"📊 Analysis keys: {analysis_data.keys() if analysis_data else 'None'}")
+    
+    try:
+        # Get file info
+        file_info = get_file_from_db(upload_id, user_id)
+        if not file_info:
+            return {"success": False, "error": "Original file not found"}
+            
+        original_filename = file_info['filename']
+        print(f"📁 Original filename: {original_filename}")
+
+        # Generate COMPLETE PDF with all analysis data
+        print("🔄 Generating complete analysis PDF...")
+        pdf_data = generate_complete_analysis_pdf(analysis_data)
+        print(f"✅ Complete PDF generated: {len(pdf_data)} bytes")
+
+        # Store in database
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        pdf_filename = f"DataPulse_Analysis_{original_filename}_{timestamp}.pdf"
+        
+        pdf_id = store_pdf_report(
+            user_id=user_id,
+            upload_id=upload_id,
+            pdf_data=pdf_data,
+            filename=pdf_filename,
+            original_filename=original_filename
+        )
+        
+        print(f"💾 PDF stored in database with ID: {pdf_id}")
+        
+        # Verify storage
+        conn = get_db_conn()
+        if conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM pdf_reports WHERE id = %s", (pdf_id,))
+            count = cursor.fetchone()[0]
+            conn.close()
+            print(f"🔍 Database verification: {count} records found")
+        
+        return {
+            "success": True,
+            "pdf_id": pdf_id,
+            "filename": pdf_filename,
+            "message": "Complete analysis PDF exported and stored successfully"
+        }
+        
+    except Exception as e:
+        print(f"❌ Export failed: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {"success": False, "error": f"Export failed: {str(e)}"}
+    
+@app.get("/api/user/profile")
+async def get_user_profile(auth: dict = Depends(get_current_auth)):
+    """Get user profile information"""
+    user_id = auth["user_id"]
+    
+    conn = get_db_conn()
+    if not conn:
+        return {
+            "user_id": user_id,
+            "email": user_id,
+            "user_name": user_id.split('@')[0],
+            "full_name": None,
+            "is_premium": False,
+            "created_at": datetime.now().isoformat(),
+            "last_login": datetime.now().isoformat()
+        }
+    
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT email, full_name, created_at, last_login_at, is_premium 
+            FROM users WHERE email = %s
+        """, (user_id,))
+        
+        row = cursor.fetchone()
+        if row:
+            return {
+                "user_id": user_id,
+                "email": row[0],
+                "user_name": row[1] or user_id.split('@')[0],
+                "full_name": row[1],
+               # You can add role field to users table
+                "is_premium": bool(row[4]),
+                "created_at": row[2].isoformat() if row[2] else datetime.now().isoformat(),
+                "last_login": row[3].isoformat() if row[3] else datetime.now().isoformat()
+            }
+        else:
+            return {
+                "user_id": user_id,
+                "email": user_id,
+                "user_name": user_id.split('@')[0],
+                "full_name": None,
+                "company": None,
+                "role": None,
+                "is_premium": False,
+                "created_at": datetime.now().isoformat(),
+                "last_login": datetime.now().isoformat()
+            }
+            
+    except Exception as e:
+        print(f"Profile fetch error: {e}")
+        return {
+            "user_id": user_id,
+            "email": user_id,
+            "user_name": user_id.split('@')[0],
+            "full_name": None,
+            "is_premium": False,
+            "created_at": datetime.now().isoformat(),
+            "last_login": datetime.now().isoformat()
+        }
+    finally:
+        conn.close()
+
+        
+@app.get("/api/user/pdf-reports")
+async def get_user_pdf_reports(auth: dict = Depends(get_current_auth)):
+    """Get user's PDF reports"""
+    user_id = auth["user_id"]
+    
+    print(f"📥 Fetching PDF reports for user: {user_id}")
+    
+    conn = get_db_conn()
+    if not conn:
+        # Fallback to in-memory storage
+        pdf_reports = uploaded_files.get('pdf_reports', {})
+        user_reports = []
+        
+        for pdf_id, report_data in pdf_reports.items():
+            if report_data.get('user_id') == user_id:
+                user_reports.append({
+                    "id": pdf_id,
+                    "filename": report_data.get('filename', 'Unknown'),
+                    "file_size": report_data.get('file_size', 0),
+                    "upload_date": report_data.get('created_at').isoformat() if report_data.get('created_at') else datetime.now().isoformat(),
+                    "analysis_date": report_data.get('created_at').isoformat() if report_data.get('created_at') else datetime.now().isoformat(),
+                    "download_url": f"/api/download-pdf/{pdf_id}"
+                })
+        
+        print(f"📋 Found {len(user_reports)} PDF reports in memory")
+        return {"reports": user_reports}
+    
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, filename, file_size, created_at 
+            FROM pdf_reports 
+            WHERE user_id = %s 
+            ORDER BY created_at DESC
+        """, (user_id,))
+        
+        reports = []
+        for row in cursor.fetchall():
+            reports.append({
+                "id": row[0],
+                "filename": row[1],
+                "file_size": row[2],
+                "upload_date": row[3].isoformat() if row[3] else datetime.now().isoformat(),
+                "analysis_date": row[3].isoformat() if row[3] else datetime.now().isoformat(),
+                "download_url": f"/api/download-pdf/{row[0]}"
+            })
+        
+        print(f"📋 Found {len(reports)} PDF reports in database")
+        return {"reports": reports}
+        
+    except Exception as e:
+        print(f"PDF reports fetch error: {e}")
+        return {"reports": []}
+    finally:
+        conn.close()
+
+@app.get("/api/download-pdf/{pdf_id}")
+async def download_pdf(pdf_id: str, auth: dict = Depends(get_current_auth)):
+    """Download PDF report"""
+    user_id = auth["user_id"]
+    
+    print(f"📥 Download request for PDF: {pdf_id} by user: {user_id}")
+    
+    conn = get_db_conn()
+    if not conn:
+        # Check in-memory storage
+        pdf_reports = uploaded_files.get('pdf_reports', {})
+        report_data = pdf_reports.get(pdf_id)
+        
+        if not report_data or report_data.get('user_id') != user_id:
+            raise HTTPException(status_code=404, detail="PDF not found")
+        
+        pdf_data = report_data.get('pdf_data')
+        filename = report_data.get('filename', 'report.pdf')
+        
+        print(f"✅ PDF found in memory: {len(pdf_data)} bytes")
+        
+        return Response(
+            content=pdf_data,
+            media_type='application/pdf',
+            headers={
+                'Content-Disposition': f'attachment; filename="{filename}"',
+                'Content-Length': str(len(pdf_data))
+            }
+        )
+    
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT filename, pdf_data, user_id 
+            FROM pdf_reports 
+            WHERE id = %s
+        """, (pdf_id,))
+        
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="PDF not found")
+        
+        filename, pdf_data, pdf_user_id = row
+        
+        # Check if user owns this PDF
+        if pdf_user_id != user_id:
+            raise HTTPException(status_code=403, detail="Access denied")
+        
+        print(f"✅ PDF found in database: {filename}, {len(pdf_data)} bytes")
+        
+        return Response(
+            content=pdf_data,
+            media_type='application/pdf',
+            headers={
+                'Content-Disposition': f'attachment; filename="{filename}"',
+                'Content-Length': str(len(pdf_data))
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"PDF download error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to download PDF")
+    finally:
+        conn.close()
+@app.get("/api/debug/verify-pdf-storage")
+async def debug_verify_pdf_storage(auth: dict = Depends(get_current_auth)):
+    """Verify PDF storage is working"""
+    user_id = auth["user_id"]
+    
+    # Create a test PDF
+    from reportlab.pdfgen import canvas
+    from io import BytesIO
+    
+    buffer = BytesIO()
+    p = canvas.Canvas(buffer)
+    p.drawString(100, 800, "TEST PDF - DataPulse Analysis")
+    p.drawString(100, 780, f"User: {user_id}")
+    p.drawString(100, 760, f"Time: {datetime.now()}")
+    p.drawString(100, 740, "This is a test PDF for verification")
+    p.save()
+    buffer.seek(0)
+    pdf_data = buffer.getvalue()
+    
+    # Store it
+    pdf_id = str(uuid.uuid4())
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    store_success = store_pdf_report(
+        user_id=user_id,
+        upload_id="debug_test",
+        pdf_data=pdf_data,
+        filename=f"debug_test_{timestamp}.pdf",
+        original_filename="debug_test.pdf"
+    )
+    
+    # Verify
+    conn = get_db_conn()
+    db_count = 0
+    if conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM pdf_reports WHERE user_id = %s", (user_id,))
+        db_count = cursor.fetchone()[0]
+        conn.close()
+    
+    return {
+        "user_id": user_id,
+        "pdf_stored": store_success,
+        "pdf_id": pdf_id,
+        "pdf_size": len(pdf_data),
+        "total_user_pdfs": db_count,
+        "message": "Test PDF storage completed"
+    }
+    
 @app.get("/api/debug/db-connection")
 async def debug_db_connection():
     """Test database connection with detailed info"""
@@ -1082,52 +1813,66 @@ async def debug_db_connection():
         debug_info["connection_test"] = "NO_CONNECTION"
     
     return debug_info
+
+# ✅ SIGNUP ENDPOINT:
 @app.post("/api/auth/signup")
 async def signup(request: SignupRequest, response: Response):
-    """User signup - REDIRECTS TO LOGIN"""
-    # Check if user exists
+    """Ultra-fast user signup"""
+    # Quick email validation
+    if not request.email or "@" not in request.email:
+        raise HTTPException(status_code=400, detail="INVALID_EMAIL")
+    
+    # Fast existence check
     existing_user = user_by_email(request.email)
     if existing_user:
         raise HTTPException(status_code=409, detail="EMAIL_TAKEN")
 
-    # Hash password
-    pw_hash = bcrypt.hashpw(request.password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
-    
-    # Create user
-    if not insert_user(request.full_name, request.email, pw_hash):
-        raise HTTPException(status_code=400, detail="Signup failed")
+    # Quick password validation
+    if len(request.password) < 6:
+        raise HTTPException(status_code=400, detail="PASSWORD_TOO_SHORT")
 
-    # ✅ REDIRECT TO LOGIN instead of auto-login
+    # Fast password hashing with optimized rounds
+    pw_hash = bcrypt.hashpw(request.password.encode("utf-8"), bcrypt.gensalt(rounds=10)).decode("utf-8")
+    
+    # Create user with minimal data
+    if not insert_user(request.full_name, request.email, pw_hash):
+        raise HTTPException(status_code=400, detail="SIGNUP_FAILED")
+
     return {
         "success": True, 
         "message": "Signup successful - Please login",
         "redirect_to_login": True
     }
 
+# ✅ LOGIN ENDPOINT:
 @app.post("/api/auth/login")
 async def login(request: LoginRequest, fastapi_request: Request, response: Response): 
-    """User login with proper session management"""
-    user = user_by_email(request.email)
+    """High-speed login with minimal overhead"""
+    # Quick validation
+    if not request.email or not request.password:
+        raise HTTPException(status_code=401, detail="INVALID_CREDENTIALS")
+
+    # Fast user lookup
+    user = user_by_email_fast(request.email)
     if not user or not user.get("password_hash"):
         raise HTTPException(status_code=401, detail="INVALID_CREDENTIALS")
 
-    # Verify password
-    if not bcrypt.checkpw(request.password.encode("utf-8"), user["password_hash"].encode("utf-8")):
+    # Optimized password verification
+    try:
+        if not bcrypt.checkpw(request.password.encode("utf-8"), user["password_hash"].encode("utf-8")):
+            raise HTTPException(status_code=401, detail="INVALID_CREDENTIALS")
+    except Exception:
         raise HTTPException(status_code=401, detail="INVALID_CREDENTIALS")
 
-    # Update last login
-    update_user_last_login(request.email)
-
-    # 🚨 FIX: Use fastapi_request instead of request for headers
+    # Get client info quickly
     xff = fastapi_request.headers.get("X-Forwarded-For")  
     ip = (xff.split(",")[0].strip() if xff else None)
-    ua = fastapi_request.headers.get("User-Agent")  
-    ua = ua[:512] if ua else None
+    ua = fastapi_request.headers.get("User-Agent", "")[:128]  # Only store first 128 chars
 
-    # Create new session
-    session_id = ensure_session(user["email"], None, ip, ua, "email")
+    # Create session WITHOUT immediate database update for last_login
+    session_id = ensure_session_fast(user["email"], ip, ua)
 
-    # Set cookie
+    # Set cookie with optimized settings
     response.set_cookie(
         key="dp_session_id",
         value=session_id,
@@ -1138,7 +1883,8 @@ async def login(request: LoginRequest, fastapi_request: Request, response: Respo
         path="/"
     )
     
-    print(f"✅ User {user['email']} logged in with new session: {session_id}")
+    # Background update for last login (don't wait for it)
+    asyncio.create_task(update_last_login_background(user["email"]))
     
     return {
         "success": True, 
@@ -1379,12 +2125,65 @@ async def google_login():
     
     return RedirectResponse(auth_url)
 
+@app.get("/api/debug/pdf-status")
+async def debug_pdf_status(auth: dict = Depends(get_current_auth)):
+    """Check PDF storage status"""
+    user_id = auth["user_id"]
+    
+    conn = get_db_conn()
+    if not conn:
+        return {"database_connection": "failed", "user_id": user_id}
+    
+    try:
+        cursor = conn.cursor()
+        
+        # Check if pdf_reports table exists and has data
+        cursor.execute("SELECT COUNT(*) FROM pdf_reports WHERE user_id = %s", (user_id,))
+        user_pdf_count = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(*) FROM pdf_reports")
+        total_pdf_count = cursor.fetchone()[0]
+        
+        # Get latest PDFs for this user
+        cursor.execute("""
+            SELECT id, filename, created_at, file_size 
+            FROM pdf_reports 
+            WHERE user_id = %s 
+            ORDER BY created_at DESC 
+            LIMIT 5
+        """, (user_id,))
+        
+        recent_pdfs = []
+        for row in cursor.fetchall():
+            recent_pdfs.append({
+                "id": row[0],
+                "filename": row[1],
+                "created_at": row[2].isoformat() if row[2] else None,
+                "file_size": row[3]
+            })
+        
+        return {
+            "database_connection": "success",
+            "user_id": user_id,
+            "user_pdf_count": user_pdf_count,
+            "total_pdf_count": total_pdf_count,
+            "recent_pdfs": recent_pdfs
+        }
+        
+    except Exception as e:
+        return {"database_connection": "error", "error": str(e)}
+    finally:
+        conn.close()
+        
 @app.get("/api/auth/google/callback")
-async def google_callback(request: Request, response: Response, code: str = None):
-    """Handle Google OAuth callback with session recording"""
+async def google_callback(request: Request, code: str = None):
+    """Handle Google OAuth callback with PROPER session management"""
     try:
         if not code:
+            print("❌ No code parameter in Google callback")
             return RedirectResponse(f"{FRONTEND_URL}/login?error=no_code")
+        
+        print(f"🔄 Google OAuth callback received with code: {code[:20]}...")
         
         # Exchange code for tokens
         token_url = "https://oauth2.googleapis.com/token"
@@ -1401,7 +2200,7 @@ async def google_callback(request: Request, response: Response, code: str = None
             tokens = token_response.json()
             
             if 'error' in tokens:
-                print(f"Token error: {tokens}")
+                print(f"❌ Token exchange error: {tokens}")
                 return RedirectResponse(f"{FRONTEND_URL}/login?error=auth_failed")
             
             # Get user info from Google
@@ -1412,7 +2211,7 @@ async def google_callback(request: Request, response: Response, code: str = None
             user_info = userinfo_response.json()
             
             if 'error' in user_info:
-                print(f"Userinfo error: {user_info}")
+                print(f"❌ Userinfo error: {user_info}")
                 return RedirectResponse(f"{FRONTEND_URL}/login?error=user_info_failed")
         
         # Extract user data
@@ -1420,7 +2219,7 @@ async def google_callback(request: Request, response: Response, code: str = None
         name = user_info.get('name', 'User')
         google_id = user_info['sub']
         
-        print(f"Google user: {email}, {name}, {google_id}")
+        print(f"✅ Google user authenticated: {email}, {name}, {google_id}")
         
         # Check if user exists by Google ID first
         existing_user = user_by_google_id(google_id)
@@ -1431,11 +2230,14 @@ async def google_callback(request: Request, response: Response, code: str = None
             if existing_user:
                 # Update existing user with Google ID
                 update_user_google_id(email, google_id)
+                print(f"✅ Updated existing user with Google ID: {email}")
             else:
                 # Create new Google user
                 if not create_google_user(email, name, google_id):
+                    print(f"❌ Failed to create Google user: {email}")
                     return RedirectResponse(f"{FRONTEND_URL}/login?error=user_creation_failed")
                 existing_user = user_by_google_id(google_id)
+                print(f"✅ Created new Google user: {email}")
         
         user_id = existing_user['email']
         
@@ -1447,33 +2249,39 @@ async def google_callback(request: Request, response: Response, code: str = None
         client_ip = xff.split(",")[0].strip() if xff else request.client.host
         user_agent = request.headers.get("User-Agent", "")[:512]
         
-        # ✅ CREATE SESSION WITH GOOGLE LOGIN METHOD
-        session_id = ensure_session(user_id, None, client_ip, user_agent, "google")
+        # 🚨 CRITICAL FIX: Create session WITHOUT deactivating others during OAuth
+        session_id = create_oauth_session(user_id, client_ip, user_agent)
         
-        # Set cookies
+        print(f"✅ Google OAuth successful for {email}, session: {session_id}")
+        
+        # 🚨 CRITICAL FIX: Use session parameter instead of cookie for development
+        redirect_url = f"{FRONTEND_URL}/analyze?session={session_id}"
+        response = RedirectResponse(url=redirect_url, status_code=302)
+        
+        # 🚨 ALSO set cookie as backup
         response.set_cookie(
             key="dp_session_id",
             value=session_id,
             httponly=True,
-            secure=True,
-            samesite="none",
+            secure=False,  # ✅ FALSE for local development
+            samesite="lax",  # ✅ "lax" for localhost
             max_age=30 * 24 * 60 * 60,  # 30 days
             path="/",
         )
         
-        print(f"✅ Google OAuth successful for {email}, session: {session_id}")
-        
-        # Redirect to analyze page
-        return RedirectResponse(f"{FRONTEND_URL}/analyze")
+        print(f"✅ Redirecting to: {redirect_url}")
+        return response
         
     except Exception as e:
-        print(f"Google OAuth error: {e}")
+        print(f"❌ Google OAuth error: {e}")
+        import traceback
+        traceback.print_exc()
         return RedirectResponse(f"{FRONTEND_URL}/login?error=auth_failed")
+
 
 # ---------------------------------------------------------
 # ✅ USAGE & SESSION MANAGEMENT ROUTES
 # ---------------------------------------------------------
-
 @app.get("/api/usage/stats")
 async def get_usage_stats_endpoint(auth: dict = Depends(get_current_auth)):
     """Get current user's usage statistics"""
@@ -1656,7 +2464,73 @@ async def debug_reports():
         return {"error": str(e), "storage": "in_memory", "reports": user_reports}
     finally:
         conn.close()
-
+        
+        
+# ✅ ENSURE THIS ENDPOINT EXISTS AND IS OPTIMIZED:
+@app.get("/api/auth/quick-check")
+async def quick_auth_check(request: Request):
+    """Ultra-fast authentication check - minimal overhead"""
+    sid = request.cookies.get("dp_session_id")
+    
+    if not sid:
+        return {"authenticated": False}
+    
+    # Check in-memory first for speed
+    if sid in user_sessions:
+        session_data = user_sessions[sid]
+        return {
+            "authenticated": True,
+            "user_id": session_data['user_id'],
+            "session_id": sid
+        }
+    
+    # Fallback to database (still fast)
+    user_email = resolve_user_from_session(sid)
+    if not user_email:
+        return {"authenticated": False}
+    
+    return {
+        "authenticated": True,
+        "user_id": user_email,
+        "session_id": sid
+    }
+    
+# ✅ ADD THIS NEW QUICK LOGIN ENDPOINT:
+@app.post("/api/auth/quick-login")
+async def quick_login(request: LoginRequest, fastapi_request: Request, response: Response):
+    """Minimal login endpoint for maximum speed"""
+    # Ultra-fast validation
+    if not request.email or not request.password:
+        raise HTTPException(status_code=401, detail="INVALID_CREDENTIALS")
+    
+    user = user_by_email_fast(request.email)
+    if not user or not user.get("password_hash"):
+        raise HTTPException(status_code=401, detail="INVALID_CREDENTIALS")
+    
+    # Quick password check
+    if not bcrypt.checkpw(request.password.encode("utf-8"), user["password_hash"].encode("utf-8")):
+        raise HTTPException(status_code=401, detail="INVALID_CREDENTIALS")
+    
+    # Fast session creation
+    session_id = ensure_session_fast(user["email"], None, None)
+    
+    # Quick cookie set
+    response.set_cookie(
+        key="dp_session_id",
+        value=session_id,
+        httponly=True,
+        secure=True,
+        samesite="none",
+        max_age=86400,
+        path="/"
+    )
+    
+    # Return minimal response
+    return {
+        "success": True,
+        "session_id": session_id,
+        "user_id": user["email"]
+    }
 # ---------------------------------------------------------
 # ✅ STARTUP EVENT
 # ---------------------------------------------------------
@@ -1723,7 +2597,7 @@ class AIService:
         
         prompt = (
             "You are a senior data analyst. Write ONE detailed, coherent paragraph (no bullet points, no markdown) "
-            f"that explains the dataset. Audience: {audience}. Business goal: {business_goal or 'general insights'}.\n\n"
+            f"THAT EXPLAINS THE COMPLETE DATASET. Audience: {audience}. Business goal: {business_goal or 'general insights'}.\n\n"
             "DATA (JSON):\n" + json.dumps(payload, default=self._json_default)
         )
 
@@ -1794,8 +2668,8 @@ class AIService:
                                           missing_total, missing_pct, numeric_cols, 
                                           categorical_cols, date_cols, duplicate_rows, 
                                           total_outliers, top_variance_cols):
+      
         """Generate comprehensive analysis using Gemini AI"""
-        
         # Prepare data payload for AI
         payload = {
             "dataset_info": {
@@ -1807,8 +2681,11 @@ class AIService:
                 "outliers": int(total_outliers),
                 "numeric_columns_count": len(numeric_cols),
                 "categorical_columns_count": len(categorical_cols),
-                "date_columns_count": len(date_cols)
+                "date_columns_count": len(date_cols),
+                "analysis_coverage": "100% COMPLETE DATASET"
+
             },
+            
             "column_analysis": {
                 "numeric_columns": numeric_cols,
                 "categorical_columns": categorical_cols[:10],  # Limit to first 10
@@ -1988,7 +2865,11 @@ class AIService:
         }
            
     def recommend_visualizations(self, df: pd.DataFrame, business_goal: Optional[str] = None) -> Dict[str, Any]:
-        """AI-powered visualization recommendations"""
+        """IMPORTANT: When recommending visualizations, ensure the data columns exist in the dataset and analyze the complete file
+        GIVE COMPLETE AND ACCURATE CHARTS .
+        For line charts, recommend datetime or sequential numeric data for x-axis.
+        For bar charts, recommend categorical data for x-axis.
+        Always specify actual column names that exist in the dataset. """
         if not self.model:
             return self._fallback_visualizations(df)
         
@@ -2022,6 +2903,16 @@ class AIService:
         **ROLE**: You are a Chief Data Visualization Officer with 15+ years experience in business intelligence, data storytelling,
         and dashboard design for Fortune 500 companies. Analyze this dataset and recommend the most appropriate visualizations.
         
+        **CRITICAL**: Recommend ONLY charts that work with the ACTUAL data columns provided below AND ANALYZE COMPLETE FILE.
+
+**RULES**:
+- STRICT INSTRUCTION -> DON'T SHOW EMPTY CHARTS AT ALL.
+- Line charts: ONLY if there are date/time columns + numeric columns
+- Bar charts: For categorical vs numeric data  
+- Pie charts: ONLY for categorical data (max 6 categories)
+- Scatter plots: ONLY if 2+ numeric columns
+- If data doesn't support a chart type, DO NOT recommend it
+
         BUSINESS CONTEXT: {business_goal or "General data analysis"}
         
         DATASET OVERVIEW:
@@ -2029,6 +2920,7 @@ class AIService:
         - Numeric columns: {numeric_cols}
         - Categorical columns: {categorical_cols}
         - Date columns: {date_cols}
+        
         
         Recommend 3-5 visualization types that would provide the most insights. For each visualization, provide:
         1. Chart type
@@ -2066,8 +2958,8 @@ class AIService:
             response = self.model.generate_content(
                 prompt,
                 generation_config={
-                    "max_output_tokens": 2048,
-                    "temperature": 0.2
+                    "max_output_tokens": 2048,   # Response Length Limit
+                    "temperature": 0.2           # Control creativity vs consistency
                 }
             )
             
@@ -2379,9 +3271,9 @@ def try_parse_dates_inplace(df: pd.DataFrame, max_cols: int = 3, min_ratio: floa
             if non_null > 0 and parsed.notna().sum() >= min_ratio * non_null:
                 df[c] = parsed
                 tried += 1
-                print(f"✅ Successfully parsed date column: {c}")
+                print(f" Successfully parsed date column: {c}")
         except Exception as e:
-            print(f"⚠️ Could not parse column {c} as date: {e}")
+            print(f"Could not parse column {c} as date: {e}")
             continue
 
 def _safe_float(x):
