@@ -2,15 +2,13 @@
 fastapi
 uvicorn
 python-multipart
-pydantic
 httpx
 # Database
 pymssql
 # Data Processing
 pandas
 numpy
-openpyxl
-xlrd
+
 # Authentication
 bcrypt
 # AI
