@@ -18,4 +18,4 @@ google-generativeai
 
 # Environment
 python-dotenv
-reportlab
+reportlab==3.6.12
