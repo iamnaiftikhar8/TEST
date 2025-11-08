@@ -369,7 +369,7 @@ def _write_session_to_db_sync(session_data: dict):
     except Exception as e:
         print(f"Background session write error: {e}")
         
-        from fpdf import FPDF
+from fpdf import FPDF
 from datetime import datetime
 from typing import Dict, Any
 import textwrap
