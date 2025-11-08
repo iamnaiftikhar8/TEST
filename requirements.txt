@@ -1,26 +1,13 @@
-# Core Requirements (Lightweight versions)
+# More conservative but Python 3.12 compatible
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
 python-multipart==0.0.6
 pydantic==2.5.0
 httpx==0.25.2
-
-# Database (Keep pymssql)
 pymssql==2.2.7
-
-# Data Processing (Remove heavy dependencies)
-pandas==1.5.3  # Older, smaller version
-numpy==1.21.6  # Compatible with pandas 1.5.3
-# REMOVED: openpyxl, xlrd (pandas handles Excel internally)
-
-# Authentication
+pandas==2.0.3
+numpy==1.24.3
 bcrypt==4.0.1
-
-# AI
 google-generativeai==0.3.2
-
-# PDF Generation
-reportlab==3.6.12
-
-# Environment
+reportlab==3.6.13
 python-dotenv==1.0.0
