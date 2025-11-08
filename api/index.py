@@ -21,7 +21,7 @@ from pydantic import BaseModel, EmailStr
 # ---------------------------------------------------------
 # ✅ Configuration
 # ---------------------------------------------------------
-FRONTEND_URL = os.getenv("FRONTEND_URL")
+FRONTEND_URL = os.getenv("FRONTEND_URL","https://test-six-fawn-47.vercel.app")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyBe8E5aR-g5ecP7OThZB6S_Sg-A2RAZ3bk")
 
 
@@ -2495,7 +2495,8 @@ async def quick_auth_check(request: Request):
         "session_id": sid
     }
     
-# ✅ ADD THIS NEW QUICK LOGIN ENDPOINT:
+    # ✅ ADD THIS NEW QUICK LOGIN ENDPOINT:
+
 @app.post("/api/auth/quick-login")
 async def quick_login(request: LoginRequest, fastapi_request: Request, response: Response):
     """Minimal login endpoint for maximum speed"""
