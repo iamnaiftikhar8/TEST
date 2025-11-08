@@ -18,4 +18,3 @@ google-generativeai
 
 # Environment
 python-dotenv
-fpdf2
