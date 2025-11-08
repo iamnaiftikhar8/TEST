@@ -1026,7 +1026,54 @@ def create_google_user(email: str, name: str, google_id: str) -> bool:
     except Exception as e:
         print(f"User creation error: {e}")
         return True
-
+def create_google_session(user_id: str, ip: Optional[str], ua: Optional[str]) -> str:
+    """Create session specifically for Google OAuth with proper settings"""
+    conn = get_db_conn()
+    
+    current_time = datetime.now()
+    expires_time = current_time + timedelta(hours=24)
+    
+    current_time_str = current_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+    expires_time_str = expires_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+    
+    if not conn:
+        # In-memory session
+        new_sid = str(uuid.uuid4())
+        user_sessions[new_sid] = {
+            'user_id': user_id,
+            'created_at': current_time,
+            'last_accessed': current_time,
+            'login_method': 'google'
+        }
+        return new_sid
+        
+    try:
+        cursor = conn.cursor()
+        
+        # Create new session
+        new_sid = str(uuid.uuid4())
+        cursor.execute(
+            """INSERT INTO user_sessions 
+               (session_id, user_id, ip, user_agent, created_at, last_accessed, expires_at, is_active, login_method) 
+               VALUES (%s, %s, %s, %s, %s, %s, %s, 1, %s)""",
+            (new_sid, user_id, ip, ua, current_time_str, current_time_str, expires_time_str, 'google')
+        )
+        conn.commit()
+        conn.close()
+        return new_sid
+        
+    except Exception as e:
+        print(f"❌ Google session creation error: {e}")
+        # Fallback to in-memory
+        new_sid = str(uuid.uuid4())
+        user_sessions[new_sid] = {
+            'user_id': user_id,
+            'created_at': current_time,
+            'last_accessed': current_time,
+            'login_method': 'google'
+        }
+        return new_sid
+    
 def check_if_admin_email(email: str) -> bool:
     """Check if email is in the admin whitelist"""
     admin_emails = {
@@ -1041,33 +1088,6 @@ def check_if_admin_email(email: str) -> bool:
     # Case-insensitive check
     return email.lower().strip() in {admin_email.lower() for admin_email in admin_emails}
 
-def create_google_user(email: str, name: str, google_id: str) -> bool:
-    """Create a user for Google OAuth"""
-    try:
-        conn = get_db_conn()
-        if conn:
-            cursor = conn.cursor()
-            current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
-            cursor.execute(
-                "INSERT INTO users (email, full_name, google_id, password_hash, created_at) VALUES (%s, %s, %s, %s, %s)",
-                (email, name, google_id, None, current_time)
-            )
-            conn.commit()
-            conn.close()
-            return True
-        else:
-            users_db[email] = {
-                'email': email,
-                'full_name': name,
-                'google_id': google_id,
-                'password_hash': None,
-                'created_at': datetime.now().isoformat(),
-                'is_premium': False
-            }
-            return True
-    except Exception as e:
-        print(f"User creation error: {e}")
-        return True
 
 def update_user_google_id(email: str, google_id: str) -> bool:
     """Update existing user with Google ID"""
@@ -2252,7 +2272,7 @@ async def google_callback(request: Request, code: str = None):
         user_agent = request.headers.get("User-Agent", "")[:512]
         
         # 🚨 CRITICAL FIX: Create session WITHOUT deactivating others during OAuth
-        session_id = create_oauth_session(user_id, client_ip, user_agent)
+        session_id = ensure_session(user_id, None, client_ip, user_agent, 'google')
         
         print(f"✅ Google OAuth successful for {email}, session: {session_id}")
         
@@ -2265,8 +2285,8 @@ async def google_callback(request: Request, code: str = None):
             key="dp_session_id",
             value=session_id,
             httponly=True,
-            secure=False,  # ✅ FALSE for local development
-            samesite="lax",  # ✅ "lax" for localhost
+            secure=True,  
+            samesite="none",  
             max_age=30 * 24 * 60 * 60,  # 30 days
             path="/",
         )
