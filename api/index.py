@@ -378,6 +378,8 @@ import textwrap
 def generate_complete_analysis_pdf(analysis_data: Dict[str, Any]) -> bytes:
     """Generate a complete PDF with all analysis data using FPDF"""
     try:
+        print("🔄 Starting complete PDF generation...")
+        
         pdf = FPDF()
         pdf.set_auto_page_break(auto=True, margin=15)
         
@@ -434,12 +436,14 @@ def generate_complete_analysis_pdf(analysis_data: Dict[str, Any]) -> bytes:
         _create_table(pdf, kpi_data, header_bg=(5, 150, 105), cell_bg=(209, 250, 229))
         pdf.ln(10)
         
-        # AI Insights and Summary
+        # AI Insights and Summary - THIS IS THE CRITICAL PART
         pdf.set_font("Arial", "B", 16)
         pdf.cell(0, 10, "AI Executive Summary", 0, 1)
         
         insights = analysis_data.get('insights', {})
         detailed_summary = analysis_data.get('detailed_summary', {})
+        
+        print(f"🔍 PDF Generator - Detailed summary keys: {list(detailed_summary.keys())}")
         
         # Executive Overview
         if detailed_summary.get('executive_overview'):
@@ -448,6 +452,8 @@ def generate_complete_analysis_pdf(analysis_data: Dict[str, Any]) -> bytes:
             pdf.set_font("Arial", "", 12)
             _wrap_text(pdf, detailed_summary['executive_overview'])
             pdf.ln(5)
+        else:
+            print("❌ No executive_overview in detailed_summary")
         
         # Key Insights
         if insights.get('key_insights'):
@@ -476,6 +482,8 @@ def generate_complete_analysis_pdf(analysis_data: Dict[str, Any]) -> bytes:
                 pdf.cell(10, 8, "•", 0, 0)
                 pdf.multi_cell(0, 8, f" {trend}")
             pdf.ln(5)
+        else:
+            print("❌ No key_trends in detailed_summary")
         
         # Business Implications
         if detailed_summary.get('business_implications'):
@@ -486,6 +494,8 @@ def generate_complete_analysis_pdf(analysis_data: Dict[str, Any]) -> bytes:
                 pdf.cell(10, 8, "•", 0, 0)
                 pdf.multi_cell(0, 8, f" {implication}")
             pdf.ln(5)
+        else:
+            print("❌ No business_implications in detailed_summary")
         
         # Recommendations
         if detailed_summary.get('recommendations'):
@@ -507,6 +517,8 @@ def generate_complete_analysis_pdf(analysis_data: Dict[str, Any]) -> bytes:
                     pdf.cell(10, 8, "•", 0, 0)
                     pdf.multi_cell(0, 8, f" {rec}")
                 pdf.ln(5)
+        else:
+            print("❌ No recommendations in detailed_summary")
         
         # Immediate Quick Wins
         if detailed_summary.get('action_items_quick_wins'):
@@ -549,25 +561,19 @@ def generate_complete_analysis_pdf(analysis_data: Dict[str, Any]) -> bytes:
         # Get PDF as bytes
         pdf_output = pdf.output(dest='S').encode('latin1')
         
-        print(f"📊 Complete PDF generated: {len(pdf_output)} bytes")
-        
-        # Debug: Print available fields
-        print(f"🔍 Available detailed_summary fields: {list(detailed_summary.keys())}")
-        for key, value in detailed_summary.items():
-            if isinstance(value, list):
-                print(f"  {key}: {len(value)} items")
-            else:
-                print(f"  {key}: {type(value)}")
+        print(f"✅ Complete PDF generated successfully: {len(pdf_output)} bytes")
+        print(f"📋 Sections included: Executive Summary, KPIs, Trends, Recommendations, etc.")
         
         return pdf_output
         
     except Exception as e:
-        print(f"❌ PDF generation error: {e}")
+        print(f"❌ Complete PDF generation failed: {e}")
         import traceback
         traceback.print_exc()
+        print("🔄 Falling back to simple PDF...")
         # Fallback to simple PDF
         return generate_simple_pdf(analysis_data)
-
+    
 def _create_table(pdf, data, header_bg=(0, 0, 0), cell_bg=(255, 255, 255)):
     """Helper function to create styled tables"""
     col_width = 95
