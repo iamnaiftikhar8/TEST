@@ -2,13 +2,15 @@
 fastapi
 uvicorn
 python-multipart
+pydantic
 httpx
 # Database
 pymssql
 # Data Processing
 pandas
 numpy
-
+openpyxl
+xlrd
 # Authentication
 bcrypt
 # AI
@@ -16,4 +18,4 @@ google-generativeai
 
 # Environment
 python-dotenv
-reportlab
+fpdf2

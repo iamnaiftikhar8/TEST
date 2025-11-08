@@ -370,245 +370,237 @@ def _write_session_to_db_sync(session_data: dict):
         print(f"Background session write error: {e}")
         
         
-def generate_complete_analysis_pdf(analysis_data: Dict[str, Any]) -> bytes:
-    """Generate a complete PDF with all analysis data"""
-    try:
-        from reportlab.lib.pagesizes import A4
-        from reportlab.pdfgen import canvas
-        from reportlab.lib.styles import getSampleStyleSheet
-        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-        from reportlab.lib.units import inch
-        from reportlab.lib import colors
-        from io import BytesIO
-        import textwrap
+from fpdf import FPDF
+from datetime import datetime
+from typing import Dict, Any
+import textwrap
 
-        buffer = BytesIO()
-        doc = SimpleDocTemplate(
-            buffer, 
-            pagesize=A4,
-            rightMargin=72, 
-            leftMargin=72,
-            topMargin=72, 
-            bottomMargin=18
-        )
+def generate_complete_analysis_pdf(analysis_data: Dict[str, Any]) -> bytes:
+    """Generate a complete PDF with all analysis data using FPDF"""
+    try:
+        print("🔄 Starting COMPLETE PDF generation with FPDF...")
         
-        styles = getSampleStyleSheet()
-        story = []
+        pdf = FPDF()
+        pdf.set_auto_page_break(auto=True, margin=15)
+        
+        # Add first page
+        pdf.add_page()
         
         # Title
-        title_style = styles["Heading1"]
-        story.append(Paragraph("DataPulse AI Analysis Report", title_style))
-        story.append(Spacer(1, 20))
+        pdf.set_font("Arial", "B", 24)
+        pdf.cell(0, 15, "DataPulse AI Analysis Report", 0, 1, "C")
+        pdf.ln(10)
         
         # File Information
-        story.append(Paragraph("<b>File Information</b>", styles["Heading2"]))
+        pdf.set_font("Arial", "B", 16)
+        pdf.cell(0, 10, "File Information", 0, 1)
+        pdf.set_font("Arial", "", 12)
+        
         file_info = analysis_data.get('file', {})
-        story.append(Paragraph(f"<b>Filename:</b> {file_info.get('name', 'Unknown')}", styles["Normal"]))
-        story.append(Paragraph(f"<b>Size:</b> {file_info.get('size_bytes', 0)} bytes", styles["Normal"]))
-        story.append(Paragraph(f"<b>Generated:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", styles["Normal"]))
-        story.append(Spacer(1, 20))
+        pdf.cell(0, 8, f"Filename: {file_info.get('name', 'Unknown')}", 0, 1)
+        pdf.cell(0, 8, f"Size: {file_info.get('size_bytes', 0)} bytes", 0, 1)
+        pdf.cell(0, 8, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", 0, 1)
+        pdf.ln(10)
         
         # Data Profiling
+        pdf.set_font("Arial", "B", 16)
+        pdf.cell(0, 10, "Data Profiling", 0, 1)
+        
         profiling = analysis_data.get('profiling', {})
-        story.append(Paragraph("<b>Data Profiling</b>", styles["Heading2"]))
-        
-        profile_data = [
-            ["Total Rows", str(profiling.get('rows', 'N/A'))],
-            ["Total Columns", str(profiling.get('columns', 'N/A'))],
-            ["Missing Values", str(profiling.get('missing_total', 'N/A'))],
-            ["Numeric Columns", str(len(profiling.get('numeric_columns', [])))],
-        ]
-        
-        profile_table = Table(profile_data, colWidths=[2*inch, 1*inch])
-        profile_table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1E40AF')),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, 0), 12),
-            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-            ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#F3F4F6')),
-            ('GRID', (0, 0), (-1, -1), 1, colors.black)
-        ]))
-        story.append(profile_table)
-        story.append(Spacer(1, 20))
+        pdf.set_font("Arial", "B", 12)
+        pdf.cell(0, 8, f"Total Rows: {profiling.get('rows', 'N/A')}", 0, 1)
+        pdf.cell(0, 8, f"Total Columns: {profiling.get('columns', 'N/A')}", 0, 1)
+        pdf.cell(0, 8, f"Missing Values: {profiling.get('missing_total', 'N/A')}", 0, 1)
+        pdf.cell(0, 8, f"Numeric Columns: {len(profiling.get('numeric_columns', []))}", 0, 1)
+        pdf.ln(10)
         
         # Key Performance Indicators
+        pdf.set_font("Arial", "B", 16)
+        pdf.cell(0, 10, "Key Performance Indicators", 0, 1)
+        
         kpis = analysis_data.get('kpis', {})
-        story.append(Paragraph("<b>Key Performance Indicators</b>", styles["Heading2"]))
+        pdf.set_font("Arial", "B", 12)
+        pdf.cell(0, 8, f"Total Rows: {kpis.get('total_rows', 'N/A')}", 0, 1)
+        pdf.cell(0, 8, f"Total Columns: {kpis.get('total_columns', 'N/A')}", 0, 1)
+        pdf.cell(0, 8, f"Missing Data: {kpis.get('missing_pct', 'N/A')}%", 0, 1)
+        pdf.cell(0, 8, f"Duplicate Rows: {kpis.get('duplicate_rows', 'N/A')}", 0, 1)
+        pdf.cell(0, 8, f"Statistical Outliers: {kpis.get('outliers_total', 'N/A')}", 0, 1)
         
-        kpi_data = [
-            ["Metric", "Value"],
-            ["Total Rows", str(kpis.get('total_rows', 'N/A'))],
-            ["Total Columns", str(kpis.get('total_columns', 'N/A'))],
-            ["Missing Data %", f"{kpis.get('missing_pct', 'N/A')}%"],
-            ["Duplicate Rows", str(kpis.get('duplicate_rows', 'N/A'))],
-            ["Statistical Outliers", str(kpis.get('outliers_total', 'N/A'))],
-        ]
         if kpis.get('rows_per_day'):
-            kpi_data.append(["Rows Per Day", str(kpis.get('rows_per_day'))])
+            pdf.cell(0, 8, f"Rows Per Day: {kpis.get('rows_per_day')}", 0, 1)
         
-        kpi_table = Table(kpi_data, colWidths=[2*inch, 1.5*inch])
-        kpi_table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#059669')),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, 0), 12),
-            ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#D1FAE5')),
-            ('GRID', (0, 0), (-1, -1), 1, colors.black)
-        ]))
-        story.append(kpi_table)
-        story.append(Spacer(1, 20))
+        pdf.ln(10)
         
         # AI Insights and Summary
+        pdf.set_font("Arial", "B", 16)
+        pdf.cell(0, 10, "AI Executive Summary", 0, 1)
+        
         insights = analysis_data.get('insights', {})
         detailed_summary = analysis_data.get('detailed_summary', {})
         
-        story.append(Paragraph("<b>AI Executive Summary</b>", styles["Heading2"]))
+        print(f"🔍 PDF Generator - Detailed summary keys: {list(detailed_summary.keys())}")
         
         # Executive Overview
         if detailed_summary.get('executive_overview'):
-            story.append(Paragraph("<b>Overview</b>", styles["Heading3"]))
-            story.append(Paragraph(detailed_summary['executive_overview'], styles["Normal"]))
-            story.append(Spacer(1, 12))
+            pdf.set_font("Arial", "B", 14)
+            pdf.cell(0, 8, "Overview", 0, 1)
+            pdf.set_font("Arial", "", 12)
+            _wrap_text(pdf, detailed_summary['executive_overview'])
+            pdf.ln(5)
         
         # Key Insights
         if insights.get('key_insights'):
-            story.append(Paragraph("<b>Key Insights</b>", styles["Heading3"]))
+            pdf.set_font("Arial", "B", 14)
+            pdf.cell(0, 8, "Key Insights", 0, 1)
+            pdf.set_font("Arial", "", 12)
             for insight in insights['key_insights']:
-                story.append(Paragraph(f"• {insight}", styles["Normal"]))
-            story.append(Spacer(1, 12))
+                pdf.cell(10, 8, "•", 0, 0)
+                pdf.multi_cell(0, 8, f" {insight}")
+            pdf.ln(5)
         
         # Data Quality Assessment
         if detailed_summary.get('data_quality_assessment'):
-            story.append(Paragraph("<b>Data Quality</b>", styles["Heading3"]))
-            story.append(Paragraph(detailed_summary['data_quality_assessment'], styles["Normal"]))
-            story.append(Spacer(1, 12))
+            pdf.set_font("Arial", "B", 14)
+            pdf.cell(0, 8, "Data Quality", 0, 1)
+            pdf.set_font("Arial", "", 12)
+            _wrap_text(pdf, detailed_summary['data_quality_assessment'])
+            pdf.ln(5)
         
-        # Key Trends & Patterns - FIXED FIELD NAME
+        # Key Trends & Patterns
         if detailed_summary.get('key_trends'):
-            story.append(Paragraph("<b>Key Trends & Patterns</b>", styles["Heading3"]))
+            pdf.set_font("Arial", "B", 14)
+            pdf.cell(0, 8, "Key Trends & Patterns", 0, 1)
+            pdf.set_font("Arial", "", 12)
             for trend in detailed_summary['key_trends']:
-                story.append(Paragraph(f"• {trend}", styles["Normal"]))
-            story.append(Spacer(1, 12))
+                pdf.cell(10, 8, "•", 0, 0)
+                pdf.multi_cell(0, 8, f" {trend}")
+            pdf.ln(5)
         
-        # Business Implications - FIXED FIELD NAME
+        # Business Implications
         if detailed_summary.get('business_implications'):
-            story.append(Paragraph("<b>Business Implications</b>", styles["Heading3"]))
+            pdf.set_font("Arial", "B", 14)
+            pdf.cell(0, 8, "Business Implications", 0, 1)
+            pdf.set_font("Arial", "", 12)
             for implication in detailed_summary['business_implications']:
-                story.append(Paragraph(f"• {implication}", styles["Normal"]))
-            story.append(Spacer(1, 12))
+                pdf.cell(10, 8, "•", 0, 0)
+                pdf.multi_cell(0, 8, f" {implication}")
+            pdf.ln(5)
         
         # Recommendations
         if detailed_summary.get('recommendations'):
             recs = detailed_summary['recommendations']
             if recs.get('short_term'):
-                story.append(Paragraph("<b>Short-term Recommendations (0-3 months)</b>", styles["Heading3"]))
+                pdf.set_font("Arial", "B", 14)
+                pdf.cell(0, 8, "Short-term Recommendations (0-3 months)", 0, 1)
+                pdf.set_font("Arial", "", 12)
                 for rec in recs['short_term']:
-                    story.append(Paragraph(f"• {rec}", styles["Normal"]))
-                story.append(Spacer(1, 12))
+                    pdf.cell(10, 8, "•", 0, 0)
+                    pdf.multi_cell(0, 8, f" {rec}")
+                pdf.ln(5)
             
             if recs.get('long_term'):
-                story.append(Paragraph("<b>Long-term Strategies (3-12 months)</b>", styles["Heading3"]))
+                pdf.set_font("Arial", "B", 14)
+                pdf.cell(0, 8, "Long-term Strategies (3-12 months)", 0, 1)
+                pdf.set_font("Arial", "", 12)
                 for rec in recs['long_term']:
-                    story.append(Paragraph(f"• {rec}", styles["Normal"]))
-                story.append(Spacer(1, 12))
+                    pdf.cell(10, 8, "•", 0, 0)
+                    pdf.multi_cell(0, 8, f" {rec}")
+                pdf.ln(5)
         
-        # Immediate Quick Wins - FIXED FIELD NAME
+        # Immediate Quick Wins
         if detailed_summary.get('action_items_quick_wins'):
-            story.append(Paragraph("<b>Immediate Quick Wins</b>", styles["Heading3"]))
+            pdf.set_font("Arial", "B", 14)
+            pdf.cell(0, 8, "Immediate Quick Wins", 0, 1)
+            pdf.set_font("Arial", "", 12)
             for win in detailed_summary['action_items_quick_wins']:
-                story.append(Paragraph(f"• {win}", styles["Normal"]))
-            story.append(Spacer(1, 12))
+                pdf.cell(10, 8, "•", 0, 0)
+                pdf.multi_cell(0, 8, f" {win}")
+            pdf.ln(5)
         
         # Risk Alerts
         if detailed_summary.get('risk_alerts'):
-            story.append(Paragraph("<b>Risk Alerts</b>", styles["Heading3"]))
+            pdf.set_font("Arial", "B", 14)
+            pdf.cell(0, 8, "Risk Alerts", 0, 1)
+            pdf.set_font("Arial", "", 12)
             for risk in detailed_summary['risk_alerts']:
-                story.append(Paragraph(f" {risk}", styles["Normal"]))
-            story.append(Spacer(1, 12))
+                pdf.cell(10, 8, "⚠", 0, 0)
+                pdf.multi_cell(0, 8, f" {risk}")
+            pdf.ln(5)
         
-        # Predictive Insights - FIXED FIELD NAME
+        # Predictive Insights
         if detailed_summary.get('predictive_insights'):
-            story.append(Paragraph("<b>Predictive Insights</b>", styles["Heading3"]))
+            pdf.set_font("Arial", "B", 14)
+            pdf.cell(0, 8, "Predictive Insights", 0, 1)
+            pdf.set_font("Arial", "", 12)
             for insight in detailed_summary['predictive_insights']:
-                story.append(Paragraph(f"• {insight}", styles["Normal"]))
-            story.append(Spacer(1, 12))
+                pdf.cell(10, 8, "•", 0, 0)
+                pdf.multi_cell(0, 8, f" {insight}")
+            pdf.ln(5)
         
-        # Industry Benchmarking - FIXED FIELD NAME
+        # Industry Benchmarking
         if detailed_summary.get('industry_comparison'):
-            story.append(Paragraph("<b>Industry Benchmarking</b>", styles["Heading3"]))
-            story.append(Paragraph(detailed_summary['industry_comparison'], styles["Normal"]))
-            story.append(Spacer(1, 12))
+            pdf.set_font("Arial", "B", 14)
+            pdf.cell(0, 8, "Industry Benchmarking", 0, 1)
+            pdf.set_font("Arial", "", 12)
+            _wrap_text(pdf, detailed_summary['industry_comparison'])
+            pdf.ln(5)
         
-        # Build the PDF
-        doc.build(story)
-        buffer.seek(0)
-        pdf_data = buffer.getvalue()
+        # Get PDF as bytes
+        pdf_output = pdf.output(dest='S').encode('latin1')
         
-        print(f"📊 Complete PDF generated: {len(pdf_data)} bytes")
-        
-        # Debug: Print available fields
-        print(f"🔍 Available detailed_summary fields: {list(detailed_summary.keys())}")
-        for key, value in detailed_summary.items():
-            if isinstance(value, list):
-                print(f"  {key}: {len(value)} items")
-            else:
-                print(f"  {key}: {type(value)}")
-        
-        return pdf_data
+        print(f"✅ Complete PDF generated successfully: {len(pdf_output)} bytes")
+        return pdf_output
         
     except Exception as e:
-        print(f"❌ PDF generation error: {e}")
+        print(f"❌ Complete PDF generation failed: {e}")
         import traceback
         traceback.print_exc()
-        # Fallback to simple PDF
+        print("🔄 Falling back to simple PDF...")
         return generate_simple_pdf(analysis_data)
 
+def _wrap_text(pdf, text, max_width=180):
+    """Helper function to wrap long text"""
+    lines = textwrap.wrap(text, width=80)
+    for line in lines:
+        pdf.cell(0, 8, line, 0, 1)
+
 def generate_simple_pdf(analysis_data: Dict[str, Any]) -> bytes:
-    """Fallback simple PDF generator"""
-    from reportlab.pdfgen import canvas
-    from io import BytesIO
+    """Fallback simple PDF generator using FPDF"""
+    pdf = FPDF()
+    pdf.add_page()
     
-    buffer = BytesIO()
-    p = canvas.Canvas(buffer)
+    # Title
+    pdf.set_font("Arial", "B", 16)
+    pdf.cell(0, 15, "DataPulse Analysis Report", 0, 1, "C")
+    pdf.ln(10)
     
-    p.setFont("Helvetica-Bold", 16)
-    p.drawString(100, 800, "DataPulse Analysis Report")
+    # Basic file info
+    pdf.set_font("Arial", "", 12)
+    pdf.cell(0, 8, f"File: {analysis_data.get('file', {}).get('name', 'Unknown')}", 0, 1)
+    pdf.cell(0, 8, f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}", 0, 1)
+    pdf.ln(10)
     
-    p.setFont("Helvetica", 12)
-    p.drawString(100, 770, f"File: {analysis_data.get('file', {}).get('name', 'Unknown')}")
-    p.drawString(100, 750, f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    
-    # Add basic info
-    y = 720
+    # KPIs
     kpis = analysis_data.get('kpis', {})
     if kpis:
-        p.drawString(100, y, f"Rows: {kpis.get('total_rows', 'N/A')}")
-        y -= 20
-        p.drawString(100, y, f"Columns: {kpis.get('total_columns', 'N/A')}")
-        y -= 20
-        p.drawString(100, y, f"Missing Data: {kpis.get('missing_pct', 'N/A')}%")
-        y -= 20
+        pdf.set_font("Arial", "B", 14)
+        pdf.cell(0, 10, "Key Metrics", 0, 1)
+        pdf.set_font("Arial", "", 12)
+        
+        pdf.cell(0, 8, f"Rows: {kpis.get('total_rows', 'N/A')}", 0, 1)
+        pdf.cell(0, 8, f"Columns: {kpis.get('total_columns', 'N/A')}", 0, 1)
+        pdf.cell(0, 8, f"Missing Data: {kpis.get('missing_pct', 'N/A')}%", 0, 1)
+        pdf.ln(10)
     
+    # Insights summary
     insights = analysis_data.get('insights', {})
     if insights.get('summary'):
-        p.drawString(100, y, "Summary:")
-        y -= 20
-        # Split long text
-        summary = insights['summary']
-        lines = textwrap.wrap(summary, width=60)
-        for line in lines[:5]:  # Limit to 5 lines
-            if y < 100:
-                p.showPage()
-                y = 800
-            p.drawString(120, y, line)
-            y -= 15
+        pdf.set_font("Arial", "B", 14)
+        pdf.cell(0, 10, "Summary", 0, 1)
+        pdf.set_font("Arial", "", 12)
+        _wrap_text(pdf, insights['summary'])
     
-    p.save()
-    buffer.seek(0)
-    return buffer.getvalue()
+    return pdf.output(dest='S').encode('latin1')
 
 
 # ---------------------------------------------------------
