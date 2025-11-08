@@ -1,12 +1,20 @@
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
-python-multipart==0.0.6
-pydantic==2.5.0
-httpx==0.25.2
-pandas==2.1.4
-numpy==1.24.3
-bcrypt==4.1.2
-google-generativeai==0.3.2
-reportlab==4.0.7
-python-dotenv==1.0.0
-# pymssql==2.2.7  # Temporarily removed
+# Core Requirements
+fastapi
+uvicorn
+python-multipart
+pydantic
+httpx
+# Database
+pymssql
+# Data Processing
+pandas
+numpy
+openpyxl
+xlrd
+# Authentication
+bcrypt
+# AI
+google-generativeai
+
+# Environment
+python-dotenv
