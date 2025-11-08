@@ -21,7 +21,7 @@ from pydantic import BaseModel, EmailStr
 # ---------------------------------------------------------
 # ✅ Configuration
 # ---------------------------------------------------------
-FRONTEND_URL = os.getenv("FRONTEND_URL","https://test-six-fawn-47.vercel.app")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "https://data-pulse-one.vercel.app")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyBe8E5aR-g5ecP7OThZB6S_Sg-A2RAZ3bk")
 
 
@@ -299,6 +299,8 @@ def ensure_session_fast(user_id: str, ip: Optional[str], ua: Optional[str]) -> s
     return new_sid
 
 # ✅ ADD BACKGROUND PROCESSING FUNCTIONS:
+
+
 # Thread pool for background tasks
 background_executor = ThreadPoolExecutor(max_workers=2)
 
@@ -367,7 +369,7 @@ def _write_session_to_db_sync(session_data: dict):
     except Exception as e:
         print(f"Background session write error: {e}")
         
-        # PDF CREATION
+        
 def generate_complete_analysis_pdf(analysis_data: Dict[str, Any]) -> bytes:
     """Generate a complete PDF with all analysis data"""
     try:
